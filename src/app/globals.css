@@ -1,0 +1,283 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #ffffff;
+  --paper-grey: #edf1f5;
+  --ink: #0a1f3c;
+  --ink-soft: #2c3e5c;
+  --cyan: #0098c7;
+  --magenta: #d6006e;
+  --toner-yellow: #f2b705;
+  --line: #d7e0e9;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-paper-grey: var(--paper-grey);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-cyan: var(--cyan);
+  --color-magenta: var(--magenta);
+  --color-toner-yellow: var(--toner-yellow);
+  --color-line: var(--line);
+  --font-display: var(--font-archivo);
+  --font-body: var(--font-plex-sans);
+  --font-data: var(--font-plex-mono);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body), system-ui, sans-serif;
+}
+
+.font-display {
+  font-family: var(--font-display), system-ui, sans-serif;
+}
+
+.font-data {
+  font-family: var(--font-data), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+/* One deliberate motion moment: the hero scan bar. Not reused elsewhere. */
+@keyframes scan-sweep {
+  0% { transform: translateY(-2px); opacity: 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { transform: translateY(148px); opacity: 0; }
+}
+
+.scan-bar {
+  animation: scan-sweep 2.4s cubic-bezier(0.4, 0, 0.2, 1) 0.3s 1 forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scan-bar {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #qr-poster, #qr-poster * {
+    visibility: visible;
+  }
+  #qr-poster {
+    position: fixed;
+    inset: 0;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   MARKETING DESIGN SYSTEM
+   Refined type scale + surface/pattern utilities for the marketing
+   surface. Archivo (display) / IBM Plex Sans (body) / Plex Mono (data)
+   stay as the brand pairing — this only tunes weight, tracking, scale
+   and rhythm so the pages read as deliberate rather than default.
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  --ink-deep: #061529;
+  --cyan-deep: #007da6;
+  --cyan-dark: #006b8f;
+  --line-strong: #b9c8d6;
+}
+
+@theme inline {
+  --color-ink-deep: var(--ink-deep);
+  --color-cyan-deep: var(--cyan-deep);
+  --color-line-strong: var(--line-strong);
+}
+
+/* ── Type scale ──────────────────────────────────────────────────── */
+
+/* Display headings: tight tracking, tight leading, optical sizing. */
+.t-display-xl,
+.t-display-lg,
+.t-display-md,
+.t-display-sm {
+  font-family: var(--font-display), system-ui, sans-serif;
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+.t-display-xl {
+  font-weight: 800;
+  font-size: clamp(2.25rem, 1.35rem + 3.9vw, 3.75rem);
+  line-height: 1.03;
+  letter-spacing: -0.033em;
+}
+
+.t-display-lg {
+  font-weight: 700;
+  font-size: clamp(1.875rem, 1.32rem + 2.4vw, 2.875rem);
+  line-height: 1.08;
+  letter-spacing: -0.028em;
+}
+
+.t-display-md {
+  font-weight: 700;
+  font-size: clamp(1.5rem, 1.22rem + 1.2vw, 2.125rem);
+  line-height: 1.14;
+  letter-spacing: -0.022em;
+}
+
+.t-display-sm {
+  font-weight: 600;
+  font-size: clamp(1.125rem, 1.02rem + 0.45vw, 1.375rem);
+  line-height: 1.24;
+  letter-spacing: -0.015em;
+}
+
+/* Body copy: slightly open leading, restrained measure. */
+.t-lead {
+  font-size: clamp(1rem, 0.95rem + 0.22vw, 1.125rem);
+  line-height: 1.62;
+  color: var(--ink-soft);
+}
+
+.t-body {
+  font-size: 0.9375rem;
+  line-height: 1.66;
+  color: var(--ink-soft);
+}
+
+.t-small {
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+/* Mono eyebrow: the recurring section label across the whole site. */
+.t-eyebrow {
+  font-family: var(--font-data), ui-monospace, monospace;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+
+/* Numeric/data emphasis — prices, counters, tokens. */
+.t-numeric {
+  font-family: var(--font-data), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/* ── Surfaces & patterns ─────────────────────────────────────────── */
+
+/* Faint engineering-paper grid. Used behind hero + feature bands. */
+.bg-blueprint {
+  background-image:
+    linear-gradient(to right, rgba(10, 31, 60, 0.055) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(10, 31, 60, 0.055) 1px, transparent 1px);
+  background-size: 56px 56px;
+}
+
+.bg-blueprint-dark {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+  background-size: 56px 56px;
+}
+
+/* Dot field, tighter than the grid — used inside cards and mockups. */
+.bg-dotfield {
+  background-image: radial-gradient(rgba(10, 31, 60, 0.13) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+/* Radial fade so patterns never hit a hard edge. */
+.mask-fade-edges {
+  -webkit-mask-image: radial-gradient(ellipse 78% 68% at 50% 42%, #000 42%, transparent 100%);
+  mask-image: radial-gradient(ellipse 78% 68% at 50% 42%, #000 42%, transparent 100%);
+}
+
+/* Marker highlight behind a word in a headline. */
+.ink-highlight {
+  position: relative;
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.ink-highlight > span {
+  position: relative;
+  z-index: 1;
+}
+
+.ink-highlight::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  left: -0.08em;
+  right: -0.08em;
+  bottom: 0.06em;
+  height: 0.34em;
+  background: color-mix(in srgb, var(--cyan) 22%, transparent);
+}
+
+/* ── Carousels ───────────────────────────────────────────────────── */
+
+/* Touch-swipeable rails: native scroll-snap, no visible scrollbar. */
+.swipe-rail {
+  display: flex;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
+
+.swipe-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.swipe-rail > * {
+  scroll-snap-align: center;
+  flex: 0 0 auto;
+}
+
+/* ── Motion ──────────────────────────────────────────────────────── */
+
+/* Announcement bar reveal — height is reserved by the wrapper so this
+   never shifts the page. */
+@keyframes announce-in {
+  from { opacity: 0; transform: translateY(-100%); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.announce-in {
+  animation: announce-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .announce-in {
+    animation: none;
+  }
+}
