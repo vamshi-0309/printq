@@ -16,10 +16,45 @@ Run with:  python -m unittest discover -s agent -v
 
 from __future__ import annotations
 
+import importlib
+import os
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from config import AgentConfig, InvalidServerUrl
+
+
+@contextmanager
+def reloaded_with(env: dict):
+    """
+    Reload printq_agent so its module-level defaults re-read the environment,
+    then put the module's original contents back.
+
+    importlib.reload re-executes the module in place, which builds fresh class
+    objects for everything it defines. Any other test file that did
+    `from printq_agent import SomeError` still holds the OLD class, so
+    `assertRaises(SomeError)` silently stops matching in whichever file happens
+    to run next -- the whole suite becomes order-dependent. Snapshotting and
+    restoring __dict__ keeps the reload local to this test.
+
+    A value of None means "remove this variable".
+    """
+    import printq_agent
+
+    original = printq_agent.__dict__.copy()
+    present = {k: v for k, v in env.items() if v is not None}
+    absent = [k for k, v in env.items() if v is None]
+
+    try:
+        with patch.dict("os.environ", present, clear=False):
+            for name in absent:
+                os.environ.pop(name, None)
+            importlib.reload(printq_agent)
+            yield printq_agent
+    finally:
+        printq_agent.__dict__.clear()
+        printq_agent.__dict__.update(original)
 
 TUNNEL = "https://little-parents-chew.loca.lt"
 LOCAL = "http://localhost:3000"
@@ -108,23 +143,11 @@ class ArgParsingTests(unittest.TestCase):
         self.assertEqual(printq_agent.parse_args(["--server", LOCAL]).server, LOCAL)
 
     def test_defaults_to_env_var(self):
-        import importlib
-        import printq_agent
-
-        with patch.dict("os.environ", {"PRINTQ_API_BASE_URL": LOCAL}):
-            importlib.reload(printq_agent)
+        with reloaded_with({"PRINTQ_API_BASE_URL": LOCAL}) as printq_agent:
             self.assertEqual(printq_agent.parse_args([]).server, LOCAL)
-        importlib.reload(printq_agent)
 
     def test_defaults_to_empty_without_env(self):
-        import importlib
-        import printq_agent
-
-        with patch.dict("os.environ", {}, clear=False):
-            import os
-
-            os.environ.pop("PRINTQ_API_BASE_URL", None)
-            importlib.reload(printq_agent)
+        with reloaded_with({"PRINTQ_API_BASE_URL": None}) as printq_agent:
             self.assertEqual(printq_agent.parse_args([]).server, "")
 
 

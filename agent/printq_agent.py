@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -109,6 +110,10 @@ class PrinterUnavailable(RuntimeError):
 
 class NoPrinterConfigured(RuntimeError):
     """The shop has queued work but no PrintQ printer chosen."""
+
+
+class SumatraNotFound(RuntimeError):
+    """The SumatraPDF executable could not be located on this machine."""
 
 
 # ----------------------------------------------------------------------
@@ -297,6 +302,97 @@ def resolve_job_printer(job: PrintJob, installed: Optional[list[str]] = None) ->
     return name, printer_id
 
 
+SUMATRA_EXE = "SumatraPDF.exe"
+
+
+def sumatra_candidates(cfg: Optional[AgentConfig] = None, env: Optional[dict] = None) -> list[tuple[str, str]]:
+    """
+    Where SumatraPDF might be, in the order worth trying, as (reason, path).
+
+    The order matters. An operator who names a path explicitly means it, so
+    that wins; a discovered install is only consulted when nothing was named.
+    """
+    env = os.environ if env is None else env
+    found: list[tuple[str, str]] = []
+
+    # 1. An explicit override. Quotes are stripped because a value pasted from
+    #    a shell or a shortcut often arrives wrapped in them.
+    explicit = (env.get("SUMATRAPDF_PATH") or "").strip().strip('"').strip("'")
+    if explicit:
+        found.append(("SUMATRAPDF_PATH", explicit))
+
+    # 2. Whatever agent.json holds. This carries a default pointing at Program
+    #    Files, so it is a candidate to test rather than a path to trust: a
+    #    stale default must not shadow a real install found below.
+    configured = (getattr(cfg, "sumatra_path", "") or "").strip()
+    if configured:
+        found.append(("agent.json sumatra_path", configured))
+
+    # 3. The per-user install, which is what SumatraPDF's own installer now
+    #    produces by default and is not on PATH.
+    local_appdata = env.get("LOCALAPPDATA")
+    if local_appdata:
+        found.append(
+            ("%LOCALAPPDATA%", str(Path(local_appdata) / "SumatraPDF" / SUMATRA_EXE))
+        )
+
+    # 4. Machine-wide installs, 64- and 32-bit.
+    for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        base = env.get(var)
+        if base:
+            found.append((f"%{var}%", str(Path(base) / "SumatraPDF" / SUMATRA_EXE)))
+
+    # De-duplicate while keeping order: several of the variables above often
+    # resolve to the same directory.
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for reason, path in found:
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((reason, path))
+    return unique
+
+
+def resolve_sumatra_path(cfg: Optional[AgentConfig] = None, env: Optional[dict] = None) -> str:
+    """
+    Find the SumatraPDF executable, or say precisely where we looked.
+
+    SumatraPDF installs per-user by default, at
+    %LOCALAPPDATA%\\SumatraPDF\\SumatraPDF.exe, and puts nothing on PATH. The
+    agent only ever tried the hardcoded Program Files path from agent.json, so
+    on a machine with a perfectly good install every print failed with
+    "[WinError 2] The system cannot find the file specified" — an error that
+    names no file and points at nothing.
+
+    PATH is tried last rather than first: a name found on PATH is whatever the
+    environment happens to expose, while the locations above are places
+    SumatraPDF is actually installed.
+    """
+    env = os.environ if env is None else env
+    candidates = sumatra_candidates(cfg, env)
+
+    for reason, path in candidates:
+        if path and os.path.isfile(path):
+            log.debug("Using SumatraPDF from %s: %s", reason, path)
+            return path
+
+    on_path = shutil.which(SUMATRA_EXE, path=env.get("PATH"))
+    if on_path:
+        log.debug("Using SumatraPDF found on PATH: %s", on_path)
+        return on_path
+
+    checked = "\n".join(f"  - {path}   ({reason})" for reason, path in candidates)
+    raise SumatraNotFound(
+        "SumatraPDF is required to print but was not found on this PC.\n"
+        "Install it from https://www.sumatrapdfreader.org/ , or set the "
+        "SUMATRAPDF_PATH environment variable to the full path of "
+        f"{SUMATRA_EXE}.\n"
+        f"Checked these locations:\n{checked}\n  - {SUMATRA_EXE} on PATH"
+    )
+
+
 def send_to_printer(pdf_path: Path, settings: dict, cfg: AgentConfig, printer_name: str) -> None:
     """
     Print to exactly the printer named. The caller resolves it; this function
@@ -314,8 +410,12 @@ def send_to_printer(pdf_path: Path, settings: dict, cfg: AgentConfig, printer_na
         )
         return
 
+    # Resolved per job rather than at startup so installing SumatraPDF fixes a
+    # failing shop without restarting the agent.
+    sumatra = resolve_sumatra_path(cfg)
+
     cmd = [
-        cfg.sumatra_path,
+        sumatra,
         "-print-to", printer_name,
         "-print-settings", sumatra_settings,
         "-silent",
