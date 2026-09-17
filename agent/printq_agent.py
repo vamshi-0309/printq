@@ -529,9 +529,21 @@ def send_to_printer(
     """
     Print to exactly the printer named. The caller resolves it; this function
     never chooses one, and in particular never consults the Windows default.
+
+    The name arrives from the claim response, which carries the printer the
+    shop selected server-side. It is used verbatim: there is no fallback to
+    the Windows default, and no substitution of another installed printer. If
+    it is unusable the job fails and says so.
     """
+    # Whitespace-only slipped through the old truthiness check and would have
+    # been handed to SumatraPDF as a printer called "   ". A name that cannot
+    # identify a printer is a failure, not something to send to the spooler.
+    printer_name = (printer_name or "").strip()
     if not printer_name:
-        raise PrinterUnavailable("No printer was supplied for this job.")
+        raise PrinterUnavailable(
+            "No printer was supplied for this job. Choose a default printer in "
+            "Dashboard > Printers."
+        )
 
     # Refuse a printer that would block on a "Save Print Output As" dialog.
     # Done here rather than earlier so the caller can still report the failure:

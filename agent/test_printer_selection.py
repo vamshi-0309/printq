@@ -21,15 +21,18 @@ from __future__ import annotations
 
 import ast
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import printq_agent  # noqa: E402
 from printq_agent import (  # noqa: E402
     PrintJob,
     PrinterUnavailable,
+    SumatraNotFound,
     resolve_job_printer,
     send_to_printer,
 )
@@ -148,27 +151,139 @@ class UnavailableSelectedPrinter(unittest.TestCase):
         self.assertEqual(name, "Export to WPS PDF")
 
 
-class SendToPrinterTargetsTheSelection(unittest.TestCase):
+class SendToPrinterBase(unittest.TestCase):
+    """
+    Supplies a SumatraPDF that actually exists.
+
+    These tests previously passed `cfg = mock.Mock(sumatra_path=
+    r"C:\\SumatraPDF.exe")`, a path that is not there on any machine. That
+    looked like it supplied an executable but did not: resolve_sumatra_path
+    correctly refuses a configured path that does not exist and falls through
+    to the other candidate locations. On a developer desktop it then found the
+    real per-user install and the tests passed; on a build runner with no
+    SumatraPDF anywhere it raised SumatraNotFound before a single assertion
+    ran, which is exactly the errors=2 that failed the release.
+
+    A real file in a temporary directory makes the resolver succeed for the
+    stated reason, so what these tests assert -- the command handed to
+    SumatraPDF -- is what they actually exercise, on any machine.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.sumatra = Path(self._tmp.name) / "SumatraPDF.exe"
+        self.sumatra.write_bytes(b"MZ")  # enough to be a file
+        self.cfg = mock.Mock(sumatra_path=str(self.sumatra))
+
+
+class SendToPrinterTargetsTheSelection(SendToPrinterBase):
     def test_passes_the_selected_printer_to_sumatra(self):
-        cfg = mock.Mock(sumatra_path=r"C:\SumatraPDF.exe")
         with mock.patch("printq_agent.DEV_MODE", False), mock.patch(
             "printq_agent.subprocess.run"
         ) as run:
-            run.return_value = mock.Mock(returncode=0, stderr=b"")
-            send_to_printer(Path("doc.pdf"), {"copies": 1}, cfg, "Export to WPS PDF")
+            run.return_value = mock.Mock(returncode=0, stderr=b"", stdout=b"")
+            send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, "Export to WPS PDF")
 
         cmd = run.call_args[0][0]
         self.assertIn("-print-to", cmd)
         self.assertEqual(cmd[cmd.index("-print-to") + 1], "Export to WPS PDF")
 
+    def test_launches_the_resolved_executable(self):
+        # The configured path is used because it exists, which is the whole
+        # reason the assertions above are reached.
+        with mock.patch("printq_agent.DEV_MODE", False), mock.patch(
+            "printq_agent.subprocess.run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0, stderr=b"", stdout=b"")
+            send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, "Export to WPS PDF")
+
+        self.assertEqual(run.call_args[0][0][0], str(self.sumatra))
+
+    def test_the_selected_printer_is_never_substituted(self):
+        # Whatever else is installed, the name that goes to -print-to is the
+        # one that came in.
+        for chosen in ("Export to WPS PDF", "HP LaserJet Pro M404", "Canon LBP2900"):
+            with self.subTest(printer=chosen):
+                with mock.patch("printq_agent.DEV_MODE", False), mock.patch(
+                    "printq_agent.subprocess.run"
+                ) as run:
+                    run.return_value = mock.Mock(returncode=0, stderr=b"", stdout=b"")
+                    send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, chosen)
+                cmd = run.call_args[0][0]
+                self.assertEqual(cmd[cmd.index("-print-to") + 1], chosen)
+
+    def test_the_command_is_a_list_never_a_shell_string(self):
+        # A printer name containing quotes or an ampersand must not be able to
+        # become part of a command line.
+        hostile = 'HP & "Laser" | Pro'
+        with mock.patch("printq_agent.DEV_MODE", False), mock.patch(
+            "printq_agent.subprocess.run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0, stderr=b"", stdout=b"")
+            send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, hostile)
+
+        args, kwargs = run.call_args
+        self.assertIsInstance(args[0], list)
+        self.assertEqual(args[0][args[0].index("-print-to") + 1], hostile)
+        self.assertNotIn("shell", kwargs)
+
     def test_refuses_an_empty_printer_name(self):
-        cfg = mock.Mock(sumatra_path=r"C:\SumatraPDF.exe")
         with mock.patch("printq_agent.DEV_MODE", False):
             with self.assertRaises(PrinterUnavailable):
-                send_to_printer(Path("doc.pdf"), {}, cfg, "")
+                send_to_printer(Path("doc.pdf"), {}, self.cfg, "")
+
+    def test_refuses_a_whitespace_only_printer_name(self):
+        # "   " is truthy, so it used to reach SumatraPDF as a printer name.
+        for blank in ("   ", "\t", "\n "):
+            with self.subTest(name=repr(blank)):
+                with mock.patch("printq_agent.DEV_MODE", False):
+                    with self.assertRaises(PrinterUnavailable):
+                        send_to_printer(Path("doc.pdf"), {}, self.cfg, blank)
+
+    def test_a_padded_printer_name_is_trimmed_not_rejected(self):
+        with mock.patch("printq_agent.DEV_MODE", False), mock.patch(
+            "printq_agent.subprocess.run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0, stderr=b"", stdout=b"")
+            send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, "  Export to WPS PDF  ")
+
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("-print-to") + 1], "Export to WPS PDF")
+
+    def test_a_non_zero_exit_is_a_clear_failure(self):
+        with mock.patch("printq_agent.DEV_MODE", False), mock.patch(
+            "printq_agent.subprocess.run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=1, stderr=b"", stdout=b"out of paper")
+            with self.assertRaises(RuntimeError) as ctx:
+                send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, "Export to WPS PDF")
+
+        message = str(ctx.exception)
+        self.assertIn("Export to WPS PDF", message)
+        self.assertIn("1", message)
+        self.assertIn("out of paper", message)
+
+    def test_a_missing_sumatra_is_reported_clearly(self):
+        # The condition the CI runner was actually in.
+        cfg = mock.Mock(sumatra_path=str(Path(self._tmp.name) / "gone.exe"))
+        with mock.patch("printq_agent.DEV_MODE", False), mock.patch.object(
+            printq_agent, "sumatra_candidates",
+            return_value=[("agent.json sumatra_path", cfg.sumatra_path)],
+        ), mock.patch.object(printq_agent.shutil, "which", return_value=None):
+            with self.assertRaises(SumatraNotFound):
+                send_to_printer(Path("doc.pdf"), {"copies": 1}, cfg, "Export to WPS PDF")
 
     def test_dev_mode_still_names_the_printer(self):
-        cfg = mock.Mock(sumatra_path=r"C:\SumatraPDF.exe")
+        with mock.patch("printq_agent.DEV_MODE", True), mock.patch(
+            "printq_agent.subprocess.run"
+        ) as run:
+            send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, "Export to WPS PDF")
+        run.assert_not_called()
+
+    def test_dev_mode_needs_no_sumatra_at_all(self):
+        # Development must stay possible on a machine without SumatraPDF.
+        cfg = mock.Mock(sumatra_path=str(Path(self._tmp.name) / "gone.exe"))
         with mock.patch("printq_agent.DEV_MODE", True), mock.patch(
             "printq_agent.subprocess.run"
         ) as run:
@@ -176,14 +291,13 @@ class SendToPrinterTargetsTheSelection(unittest.TestCase):
         run.assert_not_called()
 
 
-class PrintPathNeverConsultsWindowsDefault(unittest.TestCase):
+class PrintPathNeverConsultsWindowsDefault(SendToPrinterBase):
     def test_send_to_printer_does_not_call_get_default_printer(self):
-        cfg = mock.Mock(sumatra_path=r"C:\SumatraPDF.exe")
         with mock.patch("printq_agent.DEV_MODE", False), mock.patch(
             "printq_agent.subprocess.run"
         ) as run, mock.patch("printq_agent.win32print") as win32print:
-            run.return_value = mock.Mock(returncode=0, stderr=b"")
-            send_to_printer(Path("doc.pdf"), {"copies": 1}, cfg, "Export to WPS PDF")
+            run.return_value = mock.Mock(returncode=0, stderr=b"", stdout=b"")
+            send_to_printer(Path("doc.pdf"), {"copies": 1}, self.cfg, "Export to WPS PDF")
         win32print.GetDefaultPrinter.assert_not_called()
 
     def test_resolve_does_not_call_get_default_printer(self):
