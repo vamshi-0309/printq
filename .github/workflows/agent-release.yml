@@ -50,11 +50,50 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.11.1
 
+      # Recorded because a test that behaves differently here than on a
+      # developer machine is almost always explained by one of these lines,
+      # and reading them beats guessing from a failure summary.
+      - name: Record the build environment
+        working-directory: agent
+        shell: bash
+        run: |
+          python -VV
+          python -m pip list
+          python -c "import sys; print('exe:', sys.executable)"
+          python - <<'PY'
+          try:
+              import win32print
+              flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+              names = [p[2] for p in win32print.EnumPrinters(flags)]
+              print("printers:", names or "(none)")
+              try:
+                  print("windows default:", win32print.GetDefaultPrinter())
+              except Exception as exc:
+                  print("windows default: none —", exc)
+          except Exception as exc:
+              print("win32print unavailable:", exc)
+          PY
+
       # The agent's own tests run before anything is packaged. A build that
       # cannot pass them has no business being handed to a shop.
+      #
+      # Output is teed to a file and kept even on failure: the previous release
+      # failed here and the summary alone ("errors=2") did not say which tests
+      # or why, which is not something anyone should have to guess at.
       - name: Run agent tests
         working-directory: agent
-        run: python -m unittest discover -p "test_*.py" -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -p "test_*.py" -v 2>&1 | tee agent-tests.log
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-test-output
+          path: agent/agent-tests.log
+          retention-days: 14
 
       - name: Read agent version
         id: version

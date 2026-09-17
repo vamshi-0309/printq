@@ -52,3 +52,6 @@ agent/printq.ico
 agent/file_version_info.txt
 agent/*.spec.bak
 /dist/
+
+# CI test output captured by the release workflow
+agent/agent-tests.log

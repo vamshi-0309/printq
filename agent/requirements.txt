@@ -1,5 +1,16 @@
-pywin32
-requests
-pystray
-Pillow
-python-dotenv
+# PrintQ Agent runtime dependencies.
+#
+# Pinned deliberately. These were unpinned, which meant CI installed whatever
+# was newest on the day and could therefore fail on a build that had passed
+# locally an hour earlier -- a release pipeline that is not reproducible is
+# not a release pipeline. These are the versions the suite is verified
+# against; bump them on purpose, not by accident.
+#
+# Minimum bounds rather than exact pins would reintroduce the same problem,
+# so each is exact.
+
+pywin32==312          # Windows printing: EnumPrinters, GetPrinter, ports
+requests==2.34.2      # HTTPS to the PrintQ API
+pystray==0.19.5       # system tray icon
+Pillow==12.3.0        # icon rendering for the tray and the installer
+python-dotenv==1.2.3  # reads agent/.env in development only

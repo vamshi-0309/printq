@@ -286,16 +286,46 @@ class DevModeUnchanged(ResolutionBase):
 
 
 class RealMachine(unittest.TestCase):
-    """Against this machine's actual environment, not a fixture."""
+    """
+    Against this machine's actual environment -- asserting an invariant that
+    holds anywhere, not a fact about one machine.
 
-    def test_resolves_on_this_machine_if_installed(self):
-        expected = Path(os.environ.get("LOCALAPPDATA", "")) / "SumatraPDF" / SUMATRA_EXE
-        if not expected.is_file():
-            self.skipTest("SumatraPDF is not installed per-user on this machine")
+    This previously required SumatraPDF to be installed at a specific
+    per-user path and skipped otherwise, so it was green on a developer
+    desktop and skipped on a build runner. Neither outcome told anyone whether
+    resolution works.
 
-        resolved = resolve_sumatra_path(AgentConfig())
-        self.assertTrue(os.path.isfile(resolved))
-        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(expected)))
+    What is asserted now is true on every machine: resolution either returns a
+    path that really exists, or it raises SumatraNotFound naming where it
+    looked. There is no third outcome, and in particular it never returns a
+    path that is not there -- which is the failure that produced the original
+    "[WinError 2] The system cannot find the file specified".
+    """
+
+    def test_resolution_either_finds_a_real_file_or_says_where_it_looked(self):
+        try:
+            resolved = resolve_sumatra_path(AgentConfig())
+        except SumatraNotFound as exc:
+            message = str(exc)
+            self.assertIn("SUMATRAPDF_PATH", message)
+            self.assertIn("on PATH", message)
+            return
+
+        self.assertTrue(
+            os.path.isfile(resolved),
+            f"resolution returned {resolved!r}, which does not exist",
+        )
+
+    def test_candidates_on_this_machine_are_absolute_and_unique(self):
+        # Every candidate must be something the caller could actually launch,
+        # and the list must not check the same place twice.
+        paths = [p for _, p in sumatra_candidates(AgentConfig())]
+        self.assertTrue(paths, "no candidate locations at all")
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertTrue(os.path.isabs(path), path)
+        normalised = [os.path.normcase(os.path.normpath(p)) for p in paths]
+        self.assertEqual(len(normalised), len(set(normalised)))
 
 
 if __name__ == "__main__":

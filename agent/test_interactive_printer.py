@@ -269,20 +269,124 @@ class ExitCodeMessageIsUseful(unittest.TestCase):
         self.assertIn("Export to WPS PDF", message)
 
 
+class PrinterDiscoveryIsResilient(unittest.TestCase):
+    """
+    Listing printers must not raise, whatever state Windows is in.
+
+    win32print.GetDefaultPrinter() raises when no default printer is set --
+    the normal state of a PC that has never printed, including a fresh shop
+    counter machine and a CI runner. That call was unguarded, so the exception
+    escaped list_installed_printers(), out of the heartbeat, and killed the
+    agent loop before it could report anything. Which printer Windows prefers
+    is only used to seed a shop's first selection, so not knowing it is not a
+    reason to report no printers at all.
+    """
+
+    def _fake(self, *, default_raises=False, enum_raises=False, printers=("HP LaserJet",)):
+        fake = mock.Mock()
+        fake.PRINTER_ENUM_LOCAL = 1
+        fake.PRINTER_ENUM_CONNECTIONS = 2
+        if default_raises:
+            fake.GetDefaultPrinter.side_effect = RuntimeError("no default printer")
+        else:
+            fake.GetDefaultPrinter.return_value = printers[0] if printers else ""
+        if enum_raises:
+            fake.EnumPrinters.side_effect = RuntimeError("spooler unavailable")
+        else:
+            fake.EnumPrinters.return_value = [(0, "", p, "") for p in printers]
+        return fake
+
+    def test_no_default_printer_still_lists_printers(self):
+        with mock.patch.object(printq_agent, "win32print", self._fake(default_raises=True)):
+            found = printq_agent.list_installed_printers()
+        self.assertEqual([p["system_name"] for p in found], ["HP LaserJet"])
+        # Nothing is claimed to be the Windows default, because nothing is.
+        self.assertFalse(any(p["is_default"] for p in found))
+
+    def test_a_stopped_spooler_yields_an_empty_list_not_a_crash(self):
+        with mock.patch.object(printq_agent, "win32print", self._fake(enum_raises=True)):
+            self.assertEqual(printq_agent.list_installed_printers(), [])
+
+    def test_the_windows_default_is_still_flagged_when_it_exists(self):
+        # The heartbeat uses this to seed a shop's first selection.
+        fake = self._fake(printers=("HP LaserJet", "Other"))
+        with mock.patch.object(printq_agent, "win32print", fake):
+            found = printq_agent.list_installed_printers()
+        self.assertTrue(found[0]["is_default"])
+        self.assertFalse(found[1]["is_default"])
+
+    def test_no_pywin32_yields_an_empty_list(self):
+        with mock.patch.object(printq_agent, "win32print", None):
+            self.assertEqual(printq_agent.list_installed_printers(), [])
+
+    def test_an_unreadable_port_is_reported_as_unknown(self):
+        fake = mock.Mock()
+        fake.OpenPrinter.side_effect = RuntimeError("access denied")
+        with mock.patch.object(printq_agent, "win32print", fake):
+            self.assertEqual(printer_port("Anything"), "")
+
+    def test_a_non_dict_printer_record_is_reported_as_unknown(self):
+        # Older pywin32 builds return a tuple from GetPrinter level 2.
+        fake = mock.Mock()
+        fake.OpenPrinter.return_value = object()
+        fake.GetPrinter.return_value = ("not", "a", "dict")
+        with mock.patch.object(printq_agent, "win32print", fake):
+            self.assertEqual(printer_port("Anything"), "")
+
+
 class RealMachinePorts(unittest.TestCase):
-    """Against this machine's actual printers."""
+    """
+    Against this machine's actual printers -- asserting an invariant that is
+    true on ANY machine, not a fact about one.
 
-    def test_microsoft_print_to_pdf_really_is_on_portprompt(self):
-        port = printer_port("Microsoft Print to PDF")
-        if not port:
-            self.skipTest("Microsoft Print to PDF is not installed here")
-        self.assertIn(port.strip().upper(), INTERACTIVE_PRINTER_PORTS)
+    These previously asserted "Microsoft Print to PDF is on PORTPROMPT:" and
+    "Export to WPS PDF is not", then skipped when those printers were absent.
+    That made the result depend on which printers the host happened to have:
+    green on a developer desktop, skipped on a build runner, and failing on
+    any Windows SKU that attaches Microsoft Print to PDF to a different port.
+    A test that changes verdict with the host tests the host, not the code.
 
-    def test_a_working_virtual_printer_is_not_flagged(self):
-        port = printer_port("Export to WPS PDF")
-        if not port:
-            self.skipTest("Export to WPS PDF is not installed here")
-        self.assertNotIn(port.strip().upper(), INTERACTIVE_PRINTER_PORTS)
+    What is asserted instead holds everywhere: whatever printers exist, the
+    refusal must agree with the port, and reading a port must never raise.
+    With no printers installed the loops simply do not execute, which is a
+    correct pass rather than a skip.
+
+    The specific PORTPROMPT: rule is covered deterministically by
+    PromptingPrinterIsRefused above, with the port injected.
+    """
+
+    def test_refusal_always_agrees_with_the_port(self):
+        # Explicit, so this asserts the real path rather than DEV_MODE's
+        # early return if the environment happens to set PRINTQ_DEV_MODE.
+        self.enterContext(mock.patch.object(printq_agent, "DEV_MODE", False))
+        for printer in printq_agent.list_installed_printers():
+            name = printer["system_name"]
+            with self.subTest(printer=name):
+                port = printer_port(name)
+                prompts = bool(port) and port.strip().upper() in INTERACTIVE_PRINTER_PORTS
+
+                if prompts:
+                    with self.assertRaises(PrinterUnavailable):
+                        check_printer_can_print_unattended(name)
+                else:
+                    # Must not raise: anything else is a printer PrintQ could
+                    # have used and refused for no stated reason.
+                    check_printer_can_print_unattended(name)
+
+    def test_reading_a_port_never_raises(self):
+        # printer_port returning "" is how the caller learns "unknown"; an
+        # exception here would stop a print job on a machine whose spooler is
+        # merely being unhelpful.
+        names = [p["system_name"] for p in printq_agent.list_installed_printers()]
+        names += ["No Such Printer", "", "Microsoft Print to PDF"]
+        for name in names:
+            with self.subTest(printer=name):
+                self.assertIsInstance(printer_port(name), str)
+
+    def test_listing_printers_never_raises(self):
+        # Including on a machine with no default printer set, which is the
+        # normal state of a PC that has never printed.
+        self.assertIsInstance(printq_agent.list_installed_printers(), list)
 
 
 if __name__ == "__main__":

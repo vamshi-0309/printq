@@ -232,6 +232,12 @@ def printer_port(name: str) -> str:
         handle = win32print.OpenPrinter(name)
         try:
             info = win32print.GetPrinter(handle, 2)
+            # Level 2 returns a mapping on current pywin32, but older builds
+            # hand back a tuple. An unreadable port is reported as unknown
+            # rather than as an exception, because the caller treats unknown
+            # as "attempt the print" and a crash here would stop every job.
+            if not isinstance(info, dict):
+                return ""
             return str(info.get("pPortName") or "")
         finally:
             win32print.ClosePrinter(handle)
@@ -244,10 +250,30 @@ def list_installed_printers() -> list[dict]:
     if win32print is None:
         log.warning("win32print not available — returning empty list.")
         return []
+
+    # GetDefaultPrinter raises when Windows has no default printer set, which
+    # is the normal state on a machine that has never printed -- a fresh shop
+    # PC, or a build runner. Unguarded, that exception propagated out of the
+    # heartbeat and killed the loop before the agent could report anything at
+    # all. Which printer Windows prefers is only used to seed a shop's first
+    # selection, so not knowing it is not a reason to report no printers.
+    try:
+        default_name = win32print.GetDefaultPrinter()
+    except Exception as exc:
+        log.debug("No Windows default printer: %s", exc)
+        default_name = ""
+
+    try:
+        flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+        enumerated = win32print.EnumPrinters(flags)
+    except Exception as exc:
+        # The spooler can be stopped or unreachable. An empty list is honest;
+        # the dashboard already says "no printers detected".
+        log.warning("Could not list printers: %s", exc)
+        return []
+
     printers = []
-    default_name = win32print.GetDefaultPrinter()
-    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-    for _flags, _desc, name, _comment in win32print.EnumPrinters(flags):
+    for _flags, _desc, name, _comment in enumerated:
         printers.append({"system_name": name, "is_default": name == default_name})
     return printers
 
