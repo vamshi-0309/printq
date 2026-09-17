@@ -91,7 +91,15 @@ class ResolveSelectedPrinter(unittest.TestCase):
     def test_selecting_the_windows_default_still_works(self):
         # Choosing the same printer Windows prefers is legitimate; it must be
         # honoured because it was selected, not because Windows likes it.
-        same = dict(SELECTED, systemName=WINDOWS_DEFAULT, id="ab65ad2b")
+        #
+        # resolve_job_printer settles identity only. Whether that printer can
+        # run unattended is a separate question, asked later in send_to_printer
+        # and covered in test_interactive_printer.py -- which matters here
+        # because on this machine "Microsoft Print to PDF" is on PORTPROMPT:
+        # and would be refused by that other rule.
+        same = dict(
+            SELECTED, systemName=WINDOWS_DEFAULT, displayName=WINDOWS_DEFAULT, id="ab65ad2b"
+        )
         name, _ = resolve_job_printer(make_job(same), INSTALLED)
         self.assertEqual(name, WINDOWS_DEFAULT)
 

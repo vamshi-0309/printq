@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -202,6 +202,38 @@ class PrintQClient:
 # ----------------------------------------------------------------------
 
 
+#: Windows ports that make a print job wait for a person.
+#:
+#: PORTPROMPT: is the port Microsoft Print to PDF (and anything else that
+#: writes to a file the user picks) is attached to. Printing to it opens a
+#: "Save Print Output As" dialog and blocks until somebody answers it. There is
+#: no command-line way to supply that filename through SumatraPDF, so a job
+#: sent there can never complete unattended: it hangs until the agent's
+#: 180-second timeout, or exits 1 if the dialog is dismissed.
+INTERACTIVE_PRINTER_PORTS = {"PORTPROMPT:"}
+
+
+def printer_port(name: str) -> str:
+    """
+    The Windows port a printer is attached to, or "" if it cannot be read.
+
+    Read separately from list_installed_printers() so printer discovery and
+    the heartbeat keep working exactly as before.
+    """
+    if win32print is None:
+        return ""
+    try:
+        handle = win32print.OpenPrinter(name)
+        try:
+            info = win32print.GetPrinter(handle, 2)
+            return str(info.get("pPortName") or "")
+        finally:
+            win32print.ClosePrinter(handle)
+    except Exception as exc:  # unknown printer, access denied, driver oddity
+        log.debug("Could not read the port for %r: %s", name, exc)
+        return ""
+
+
 def list_installed_printers() -> list[dict]:
     if win32print is None:
         log.warning("win32print not available — returning empty list.")
@@ -264,7 +296,9 @@ def build_sumatra_settings(settings: dict) -> str:
     return ",".join(parts)
 
 
-def resolve_job_printer(job: PrintJob, installed: Optional[list[str]] = None) -> tuple[str, Optional[str]]:
+def resolve_job_printer(
+    job: PrintJob, installed: Optional[list[str]] = None
+) -> tuple[str, Optional[str]]:
     """
     Work out which printer this job must go to, and refuse to guess.
 
@@ -300,6 +334,40 @@ def resolve_job_printer(job: PrintJob, installed: Optional[list[str]] = None) ->
         )
 
     return name, printer_id
+
+
+def check_printer_can_print_unattended(
+    printer_name: str,
+    label: Optional[str] = None,
+    port_lookup: Optional[Callable[[str], str]] = None,
+) -> None:
+    """
+    Refuse a printer that will stop and ask a person where to save the output.
+
+    Deliberately called from send_to_printer, not from resolve_job_printer.
+    The job has to be in PRINT_ATTEMPTED before the agent is allowed to report
+    a result: /api/agent/jobs/<id>/result rejects anything else with 409, and
+    jobState.ts has no CLAIMED -> FAILED edge. Checking earlier -- which is
+    where this started -- left the job stranded in CLAIMED with the agent
+    unable to say why, which is worse than the failure it was preventing.
+
+    Skipped in DEV_MODE, which never launches SumatraPDF and so can never
+    raise the dialog.
+    """
+    if DEV_MODE:
+        return
+
+    port = (port_lookup or printer_port)(printer_name)
+    if not port or port.strip().upper() not in INTERACTIVE_PRINTER_PORTS:
+        return
+
+    shown = label or printer_name
+    raise PrinterUnavailable(
+        f"{shown} saves to a file and makes Windows ask where to put it "
+        f"(port {port.strip()}), so PrintQ cannot print to it unattended - "
+        "the job stops waiting for a Save-as dialog nobody is there to answer. "
+        "Choose a real printer as the PrintQ default in Dashboard > Printers."
+    )
 
 
 SUMATRA_EXE = "SumatraPDF.exe"
@@ -393,13 +461,25 @@ def resolve_sumatra_path(cfg: Optional[AgentConfig] = None, env: Optional[dict] 
     )
 
 
-def send_to_printer(pdf_path: Path, settings: dict, cfg: AgentConfig, printer_name: str) -> None:
+def send_to_printer(
+    pdf_path: Path,
+    settings: dict,
+    cfg: AgentConfig,
+    printer_name: str,
+    port_lookup: Optional[Callable[[str], str]] = None,
+) -> None:
     """
     Print to exactly the printer named. The caller resolves it; this function
     never chooses one, and in particular never consults the Windows default.
     """
     if not printer_name:
         raise PrinterUnavailable("No printer was supplied for this job.")
+
+    # Refuse a printer that would block on a "Save Print Output As" dialog.
+    # Done here rather than earlier so the caller can still report the failure:
+    # by this point the job is PRINT_ATTEMPTED, which is the only state the
+    # result endpoint accepts.
+    check_printer_can_print_unattended(printer_name, port_lookup=port_lookup)
 
     sumatra_settings = build_sumatra_settings(settings)
 
@@ -424,8 +504,17 @@ def send_to_printer(pdf_path: Path, settings: dict, cfg: AgentConfig, printer_na
     log.info("Sending to printer: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, timeout=180)
     if result.returncode != 0:
+        # SumatraPDF reports on stdout and leaves stderr empty, so the previous
+        # message was always the bare "SumatraPDF exited 1: " — a failure with
+        # nothing in it. Include whatever it did say.
+        detail = (
+            result.stderr.decode(errors="replace").strip()
+            or result.stdout.decode(errors="replace").strip()
+            or "it produced no output"
+        )
         raise RuntimeError(
-            f"SumatraPDF exited {result.returncode}: {result.stderr.decode(errors='replace')}"
+            f"{printer_name} did not accept the job (SumatraPDF exited "
+            f"{result.returncode}): {detail}"
         )
 
 
