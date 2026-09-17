@@ -16,6 +16,25 @@ from urllib.parse import urlparse
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "PrintQ"
 CONFIG_FILE = CONFIG_DIR / "agent.json"
 
+#: Where an installed agent talks to, unless the operator types something else.
+#:
+#: A shop that installs PrintQAgent-Setup.exe must never have to discover,
+#: type, or be told a server address: the installed product has exactly one
+#: server. Development overrides it with --server or PRINTQ_API_BASE_URL.
+DEFAULT_SERVER_URL = "https://printq-rho.vercel.app"
+
+#: Where the agent keeps the copy of SumatraPDF it manages itself.
+#:
+#: Under LOCALAPPDATA rather than Program Files so it can be written without
+#: administrator rights -- the agent runs as the shop's ordinary desktop user,
+#: and a printing tool it can repair on its own beats one that needs an admin
+#: to reinstall. The installer puts a copy here too; whichever arrives first,
+#: the resolver finds the same path.
+MANAGED_SUMATRA_DIR = (
+    Path(os.environ.get("LOCALAPPDATA", Path.home())) / "PrintQ" / "SumatraPDF"
+)
+MANAGED_SUMATRA_EXE = MANAGED_SUMATRA_DIR / "SumatraPDF.exe"
+
 
 class InvalidServerUrl(ValueError):
     """The server URL typed into the pairing dialog is not usable."""
@@ -69,7 +88,7 @@ def normalize_base_url(raw: str) -> str:
 
 @dataclass
 class AgentConfig:
-    api_base_url: str = ""
+    api_base_url: str = DEFAULT_SERVER_URL
     shop_id: str = ""
     shop_name: str = ""
     agent_id: str = ""
@@ -77,6 +96,10 @@ class AgentConfig:
     sumatra_path: str = r"C:\Program Files\SumatraPDF\SumatraPDF.exe"
     libreoffice_path: str = r"C:\Program Files\LibreOffice\program\soffice.exe"
     work_dir: str = str(Path(os.environ.get("APPDATA", Path.home())) / "PrintQ" / "jobs")
+    #: Set from the UI. Persisted so a paused agent stays paused across a
+    #: restart -- an operator who paused printing to change toner does not
+    #: expect Windows rebooting overnight to undo that.
+    paused: bool = False
 
     @property
     def is_paired(self) -> bool:

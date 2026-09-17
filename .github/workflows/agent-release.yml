@@ -1,0 +1,141 @@
+name: Build PrintQ Agent installer
+
+# Deliberately NOT on every push to main.
+#
+# Publishing a release on every ordinary commit would mean a shop could
+# download a half-finished agent, and `releases/latest` -- which the website
+# points at -- would swing around under them. A release is an explicit act:
+# push a tag, or run the workflow by hand.
+#
+#   git tag agent-v1.0.0 && git push origin agent-v1.0.0
+#
+# Pull requests touching the agent still get built (but never published), so a
+# change that breaks packaging is caught before it is tagged.
+
+on:
+  push:
+    tags:
+      - "agent-v*"
+  pull_request:
+    paths:
+      - "agent/**"
+      - "installer/**"
+      - ".github/workflows/agent-release.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub Release with the installer"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
+
+      # The agent's own tests run before anything is packaged. A build that
+      # cannot pass them has no business being handed to a shop.
+      - name: Run agent tests
+        working-directory: agent
+        run: python -m unittest discover -p "test_*.py" -v
+
+      - name: Read agent version
+        id: version
+        working-directory: agent
+        shell: bash
+        run: |
+          VERSION=$(python -c "from version import AGENT_VERSION; print(AGENT_VERSION)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Agent version: $VERSION"
+
+      # A tag must match the version in version.py, or the installer would
+      # announce one number while the agent reports another.
+      - name: Check the tag matches version.py
+        if: startsWith(github.ref, 'refs/tags/agent-v')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#agent-v}"
+          if [ "$TAG_VERSION" != "${{ steps.version.outputs.version }}" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match version.py (${{ steps.version.outputs.version }})."
+            echo "Bump AGENT_VERSION in agent/version.py, or retag."
+            exit 1
+          fi
+
+      - name: Generate icon and version resource
+        working-directory: agent
+        run: python build_support.py
+
+      - name: Build executable
+        working-directory: agent
+        env:
+          PRINTQ_AGENT_VERSION: ${{ steps.version.outputs.version }}
+        run: pyinstaller --noconfirm --clean printq_agent.spec
+
+      - name: Verify the executable exists
+        working-directory: agent
+        shell: bash
+        run: |
+          test -f dist/PrintQAgent.exe || { echo "PyInstaller produced no executable"; exit 1; }
+          ls -la dist/
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: cmd
+        run: |
+          "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.version }} installer\PrintQAgent.iss
+
+      - name: Verify the installer exists
+        shell: bash
+        run: |
+          test -f dist/PrintQAgent-Setup.exe || { echo "Inno Setup produced no installer"; exit 1; }
+          ls -la dist/
+
+      # Every build is downloadable from the run, which is how a change gets
+      # tested before anyone tags it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrintQAgent-Setup-${{ steps.version.outputs.version }}
+          path: dist/PrintQAgent-Setup.exe
+          retention-days: 30
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/agent-v') || inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          # The website finds releases by this exact prefix and asset name.
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/agent-v') && github.ref_name || format('agent-v{0}', steps.version.outputs.version) }}
+          name: PrintQ Agent ${{ steps.version.outputs.version }}
+          files: dist/PrintQAgent-Setup.exe
+          draft: false
+          prerelease: false
+          body: |
+            ## PrintQ Agent ${{ steps.version.outputs.version }}
+
+            The Windows program that connects a shop computer to PrintQ.
+
+            **[Download PrintQAgent-Setup.exe](https://printq-rho.vercel.app/downloads/windows)**
+
+            Windows 10 or 11, 64-bit. No administrator rights needed, and no
+            Python, Node or developer tools to install.
+
+            Setup: install, open PrintQ Agent, enter the pairing code from your
+            PrintQ dashboard under **Agent**, then choose your printer.

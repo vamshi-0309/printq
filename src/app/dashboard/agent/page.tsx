@@ -132,26 +132,27 @@ export default function AgentPage() {
         <div className="border border-line bg-paper px-4 py-4">
           <ol className="space-y-2.5 text-[13px] leading-relaxed text-ink-soft">
             <li>
-              <span className="font-medium text-ink">1.</span> Download and install the PrintQ
-              agent on the Windows PC connected to your printer.
+              <span className="font-medium text-ink">1.</span> Download PrintQ Agent on the
+              Windows PC connected to your printer, and double-click it to install. No other
+              software is needed.
             </li>
             <li>
-              <span className="font-medium text-ink">2.</span> Generate a pairing code below and
-              type it into the agent.
+              <span className="font-medium text-ink">2.</span> PrintQ Agent opens by itself after
+              installing. Generate a pairing code below and type it into its window.
             </li>
             <li>
-              <span className="font-medium text-ink">3.</span> The agent reports your printers
-              automatically — they appear on the{" "}
+              <span className="font-medium text-ink">3.</span> Choose your printer in PrintQ
+              Agent, or on the{" "}
               <Link href="/dashboard/printers" className="text-cyan underline underline-offset-2">
                 Printers
               </Link>{" "}
-              page within a few seconds.
+              page here. Your computer appears below once it connects.
             </li>
           </ol>
 
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <a
-              href="/downloads/PrintQAgent-setup.exe"
+              href="/downloads/windows"
               className="border border-ink px-4 py-2 text-[13px] font-medium text-ink transition-colors hover:bg-paper-grey"
             >
               Download for Windows

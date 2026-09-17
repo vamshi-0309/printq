@@ -37,13 +37,16 @@ import requests
 
 from config import (
     AgentConfig,
+    DEFAULT_SERVER_URL,
     InvalidServerUrl,
+    MANAGED_SUMATRA_EXE,
     clear_config,
     load_config,
     normalize_base_url,
     save_config,
 )
 from tray import TrayIcon
+from version import AGENT_VERSION, user_agent
 
 try:
     import win32print  # type: ignore
@@ -135,6 +138,9 @@ class PrintQClient:
             "X-PrintQ-Agent-Id": self.agent_id,
             "X-PrintQ-Agent-Secret": self.agent_secret,
             "Content-Type": "application/json",
+            # Identifies the build in server logs without carrying anything
+            # identifying about the shop.
+            "User-Agent": user_agent(),
         }
 
     def heartbeat(self, printers: list[dict], hostname: str = "") -> dict:
@@ -143,7 +149,7 @@ class PrintQClient:
             headers=self._headers(),
             json={
                 "printers": printers,
-                "agent_version": "1.0.0",
+                "agent_version": AGENT_VERSION,
                 "hostname": hostname,
             },
             timeout=10,
@@ -373,6 +379,20 @@ def check_printer_can_print_unattended(
 SUMATRA_EXE = "SumatraPDF.exe"
 
 
+def install_dir() -> Path:
+    """
+    The directory the running agent lives in.
+
+    Under PyInstaller, sys.executable is the installed PrintQAgent.exe; from
+    source it is the interpreter, so the module's own directory is used
+    instead. The installer can drop files next to the executable and have the
+    agent find them either way.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def sumatra_candidates(cfg: Optional[AgentConfig] = None, env: Optional[dict] = None) -> list[tuple[str, str]]:
     """
     Where SumatraPDF might be, in the order worth trying, as (reason, path).
@@ -396,7 +416,19 @@ def sumatra_candidates(cfg: Optional[AgentConfig] = None, env: Optional[dict] = 
     if configured:
         found.append(("agent.json sumatra_path", configured))
 
-    # 3. The per-user install, which is what SumatraPDF's own installer now
+    # 3. The copy PrintQ manages itself, placed by the installer or fetched by
+    #    the agent on first run. Checked before anything the machine happens to
+    #    have lying around, because this one's version is known.
+    managed = env.get("PRINTQ_MANAGED_SUMATRA") or str(MANAGED_SUMATRA_EXE)
+    if managed:
+        found.append(("PrintQ managed copy", managed))
+
+    # 4. Beside the installed agent, for an installer that chose to place it
+    #    in the program directory instead.
+    beside = install_dir() / "SumatraPDF" / SUMATRA_EXE
+    found.append(("next to PrintQ Agent", str(beside)))
+
+    # 5. The per-user install, which is what SumatraPDF's own installer now
     #    produces by default and is not on PATH.
     local_appdata = env.get("LOCALAPPDATA")
     if local_appdata:
@@ -404,7 +436,7 @@ def sumatra_candidates(cfg: Optional[AgentConfig] = None, env: Optional[dict] = 
             ("%LOCALAPPDATA%", str(Path(local_appdata) / "SumatraPDF" / SUMATRA_EXE))
         )
 
-    # 4. Machine-wide installs, 64- and 32-bit.
+    # 6. Machine-wide installs, 64- and 32-bit.
     for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
         base = env.get(var)
         if base:
@@ -523,12 +555,59 @@ def send_to_printer(
 # ----------------------------------------------------------------------
 
 
+def safe_job_filename(raw: str, fallback: str = "document.pdf") -> str:
+    """
+    Turn a customer-supplied filename into something safe to write.
+
+    The name travels customer -> upload -> order row -> claim response -> here,
+    and arrives as a plain string. `job_dir / raw` is a path join, so a name
+    like "../../Startup/x.pdf" (or its backslash form) would place the file
+    outside the job
+    directory entirely. The upload route sanitises the name it builds a STORAGE
+    path from, but keeps the original for display, so the agent cannot assume
+    it has been cleaned -- and the agent is what actually touches this disk.
+
+    Everything except the final path component is discarded, along with the
+    characters Windows forbids in a name. The extension is preserved because
+    the caller decides what to do with the file from it.
+    """
+    name = str(raw or "").strip().replace("\\", "/")
+
+    # Take only the last segment: drops "../", absolute paths and drive letters.
+    name = name.rsplit("/", 1)[-1]
+
+    # ":" would reintroduce a drive or an NTFS alternate data stream.
+    name = "".join("_" if ch in '<>:"|?*' or ord(ch) < 32 else ch for ch in name)
+
+    # A name that is only dots ("." or "..") is not a file.
+    if not name.strip(". ") or name in (".", ".."):
+        return fallback
+
+    # Windows reserved device names, with or without an extension.
+    stem = name.split(".", 1)[0].upper()
+    if stem in {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }:
+        name = f"_{name}"
+
+    # Long names blow past MAX_PATH once joined to the job directory.
+    if len(name) > 120:
+        suffix = Path(name).suffix[:20]
+        name = name[: 120 - len(suffix)] + suffix
+
+    return name or fallback
+
+
 def process_job(client: PrintQClient, job: PrintJob, cfg: AgentConfig) -> None:
     work_dir = Path(cfg.work_dir)
     job_dir = work_dir / job.jobId
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = Path(job.filename).suffix.lower()
+    # Never join a customer-supplied name straight onto a path.
+    safe_name = safe_job_filename(job.filename)
+    ext = Path(safe_name).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         client.report_result(job.jobId, "error", f"Unsupported file type: {ext}")
         return
@@ -546,7 +625,7 @@ def process_job(client: PrintQClient, job: PrintJob, cfg: AgentConfig) -> None:
 
     log.info("Job %s will print to %r (PrintQ printer %s)", job.jobId, printer_name, printer_id)
 
-    downloaded = job_dir / job.filename
+    downloaded = job_dir / safe_name
     client.download_file(job.downloadUrl, downloaded)
 
     if ext in CONVERTIBLE_EXTENSIONS:
@@ -601,6 +680,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         description="PrintQ Windows print agent.",
     )
     parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "Run the loop with no window, as the agent did before it had a UI. "
+            "Used for development and automated checks; an installed agent "
+            "always opens its window."
+        ),
+    )
+    parser.add_argument(
+        "--minimised",
+        "--minimized",
+        dest="minimised",
+        action="store_true",
+        help=(
+            "Start with the window hidden in the system tray. Windows startup "
+            "uses this so a reboot does not put a window in the shop's face."
+        ),
+    )
+    parser.add_argument(
         "--server",
         metavar="URL",
         default=os.environ.get("PRINTQ_API_BASE_URL", ""),
@@ -652,7 +750,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         log.error("Invalid --server value: %s", exc)
         return
 
-    if not cfg.is_paired:
+    if not cfg.is_paired and args.headless:
         log.info("No stored credentials — launching pairing dialog.")
         result = run_pairing()
         if result is None:
@@ -669,14 +767,27 @@ def main(argv: Optional[list[str]] = None) -> None:
     log.info("Using PrintQ server: %s", cfg.api_base_url)
     Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
 
+    if not args.headless:
+        # The installed product. Pairing, printer choice and status all happen
+        # in the window; imported here so the headless path never needs tkinter.
+        from app_ui import run as run_ui
+
+        run_ui(cfg, start_minimised=args.minimised)
+        return
+
+    # Headless: the same loop the window drives, with a tray icon instead of a
+    # window. Kept on AgentService rather than a second inline copy, because two
+    # implementations of "claim, print, report" are two things to keep correct.
+    from agent_service import AgentService, Status
+
+    service = AgentService(cfg)
+
     def on_quit() -> None:
-        global _running
-        _running = False
+        service.stop(timeout=5)
 
     def on_repair() -> None:
-        global _running
         clear_config()
-        _running = False
+        service.stop(timeout=5)
         log.info("Config cleared — restart the agent to re-pair.")
 
     tray = TrayIcon(
@@ -687,58 +798,27 @@ def main(argv: Optional[list[str]] = None) -> None:
     tray.run_detached()
     tray.set_status("yellow", "Connecting…")
 
-    client = PrintQClient(cfg)
-    hostname = os.environ.get("COMPUTERNAME", "")
+    def mirror(status: Status) -> None:
+        colour = {
+            "connected": "green",
+            "printing": "green",
+            "offline": "yellow",
+            "no_printer": "yellow",
+            "auth_error": "red",
+            "stopped": "grey",
+        }.get(status.state, "grey")
+        tray.set_status(colour, status.detail)
 
-    last_heartbeat = 0.0
-    consecutive_errors = 0
-    warned_no_printer = False
+    service._on_change = mirror
+    service.start()
 
-    while _running:
-        now = time.time()
-
-        if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
-            try:
-                client.heartbeat(list_installed_printers(), hostname)
-                last_heartbeat = now
-                consecutive_errors = 0
-                tray.set_status("green", f"Connected — {cfg.shop_name}")
-            except AgentAuthError:
-                log.error("Auth rejected — check licence and pairing.")
-                tray.set_status("red", "Auth rejected")
-                time.sleep(30)
-                continue
-            except requests.RequestException as exc:
-                consecutive_errors += 1
-                log.warning("Heartbeat failed (%d): %s", consecutive_errors, exc)
-                tray.set_status("yellow", "Connection issue")
-
-        try:
-            job = client.claim_next_job()
-            warned_no_printer = False
-        except NoPrinterConfigured as exc:
-            # Work is waiting but the shop has not chosen a printer. Log once
-            # per occurrence rather than every five seconds, and say so in the
-            # tray where the owner will actually see it.
-            if not warned_no_printer:
-                log.error("%s", exc)
-                warned_no_printer = True
-            tray.set_status("yellow", "No printer selected in PrintQ")
-            job = None
-        except requests.RequestException as exc:
-            log.warning("Job poll failed: %s", exc)
-            job = None
-
-        if job:
-            log.info("Claimed job %s", job.jobId)
-            tray.set_status("green", f"Printing job {job.jobId[:8]}…")
-            try:
-                process_job(client, job, cfg)
-            except Exception:
-                log.exception("Unhandled error processing job %s", job.jobId)
-            tray.set_status("green", f"Connected — {cfg.shop_name}")
-
-        time.sleep(POLL_INTERVAL_SECONDS)
+    try:
+        # The service owns the loop; this thread just waits for it to finish.
+        while service._thread and service._thread.is_alive():
+            service._thread.join(timeout=1)
+    except KeyboardInterrupt:
+        log.info("Interrupted — stopping.")
+        service.stop(timeout=5)
 
     tray.stop()
     log.info("Agent stopped.")

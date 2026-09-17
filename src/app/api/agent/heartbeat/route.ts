@@ -91,9 +91,22 @@ export async function POST(req: NextRequest) {
     .limit(1)
     .single();
 
+  // Echo back which printer this shop has chosen, so the agent's own window
+  // can show it without inventing a second opinion. The agent displays this;
+  // it never decides it. The claim route remains the only thing that picks a
+  // printer for an actual job.
+  const { data: selected } = await supabase
+    .from("printers")
+    .select("system_name")
+    .eq("shop_id", auth.shopId)
+    .eq("is_default", true)
+    .eq("is_enabled", true)
+    .maybeSingle();
+
   return NextResponse.json({
     status: "ok",
     printers_saved: printers.length - printerErrors.length,
+    selected_printer: selected?.system_name ?? null,
     licence: licence?.status ?? "unknown",
     heartbeat_interval_seconds: 20,
     server_time: new Date().toISOString(),

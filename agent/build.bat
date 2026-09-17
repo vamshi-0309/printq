@@ -1,31 +1,45 @@
 @echo off
-REM PrintQ Agent — PyInstaller build script
-REM Run this from the agent/ directory on a Windows machine with Python 3.10+.
+REM PrintQ Agent - local Windows build.
 REM
-REM Prerequisites:
-REM   pip install pyinstaller pywin32 requests pystray Pillow python-dotenv
+REM Produces agent\dist\PrintQAgent.exe, the same way CI does. To build the
+REM full installer as well you also need Inno Setup 6 and:
+REM
+REM   "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" ..\installer\PrintQAgent.iss
+REM
+REM Releases are normally built by .github/workflows/agent-release.yml rather
+REM than here; this exists for trying a change without pushing a tag.
+REM
+REM Prerequisites:  pip install -r requirements.txt pyinstaller
 
-echo Building PrintQ Agent...
+setlocal
 
-pyinstaller ^
-    --onefile ^
-    --windowed ^
-    --name PrintQAgent ^
-    --add-data "config.py;." ^
-    --add-data "pairing.py;." ^
-    --add-data "tray.py;." ^
-    --hidden-import pystray._win32 ^
-    --hidden-import win32print ^
-    printq_agent.py
+echo.
+echo === PrintQ Agent build ===
+echo.
 
-if %ERRORLEVEL% EQU 0 (
+echo [1/3] Running agent tests...
+python -m unittest discover -p "test_*.py"
+if errorlevel 1 (
     echo.
-    echo Build successful! Output: dist\PrintQAgent.exe
-    echo.
-) else (
-    echo.
-    echo Build failed. Check the output above for errors.
-    echo.
+    echo Tests failed. Not building.
+    exit /b 1
 )
 
-pause
+echo.
+echo [2/3] Generating icon and version resource...
+python build_support.py
+if errorlevel 1 exit /b 1
+
+echo.
+echo [3/3] Building executable...
+pyinstaller --noconfirm --clean printq_agent.spec
+if errorlevel 1 (
+    echo.
+    echo Build failed.
+    exit /b 1
+)
+
+echo.
+echo Done: dist\PrintQAgent.exe
+echo.
+endlocal
