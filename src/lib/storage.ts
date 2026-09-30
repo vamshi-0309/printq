@@ -56,3 +56,26 @@ export async function deleteFile(storagePath: string): Promise<void> {
   const { error } = await supabase.storage.from(BUCKET).remove([storagePath]);
   if (error) throw new Error(`Storage delete failed: ${error.message}`);
 }
+
+/**
+ * Read a stored file's bytes, for code that must examine what was actually
+ * uploaded rather than trust what a client reported about it.
+ *
+ * Throws StorageObjectMissing when the object is not there, so callers can
+ * tell "no such upload" apart from "storage is unavailable".
+ */
+export class StorageObjectMissing extends Error {}
+
+export async function downloadFile(storagePath: string): Promise<Uint8Array> {
+  const supabase = createServiceRoleClient();
+  const { data, error } = await supabase.storage.from(BUCKET).download(storagePath);
+
+  if (error || !data) {
+    const message = error?.message ?? "no data";
+    if (/not.?found|does not exist|404/i.test(message)) {
+      throw new StorageObjectMissing(`No stored file at ${storagePath}`);
+    }
+    throw new Error(`Storage download failed: ${message}`);
+  }
+  return new Uint8Array(await data.arrayBuffer());
+}

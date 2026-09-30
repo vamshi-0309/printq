@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServiceRoleClient } from "@/lib/supabase/server";
-import { validateFile } from "@/lib/fileValidation";
+import { MAX_PAGE_COUNT, validateFile } from "@/lib/fileValidation";
 import { countDocumentPages, EncryptedPdfError } from "@/lib/documentPages";
 
 const BUCKET = "print-files";
@@ -54,6 +54,16 @@ export async function POST(req: NextRequest) {
   try {
     const result = await countDocumentPages(bytes, file.name);
     if (result.known) {
+      // Checked here as well as at order time so the customer is told before
+      // they spend time choosing options for a job that can't be accepted.
+      if (result.pages > MAX_PAGE_COUNT) {
+        return NextResponse.json(
+          {
+            error: `That document has ${result.pages} pages. The most one order can print is ${MAX_PAGE_COUNT}.`,
+          },
+          { status: 400 }
+        );
+      }
       pageCount = result.pages;
       pageCountSource = result.source;
     } else {

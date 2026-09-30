@@ -65,6 +65,26 @@ const UNINFORMATIVE_MIMES = new Set([
 
 export const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
 
+/**
+ * The most pages one order may print.
+ *
+ * There was no limit at all: a 20,000-page PDF would be accepted, priced and
+ * queued, and the shop's printer would work through it. Generous enough for a
+ * bound thesis or a full semester's notes, small enough that a mistake -- or
+ * someone deliberately tying up a shop's printer -- is caught before paper.
+ */
+export const MAX_PAGE_COUNT = 1000;
+
+/**
+ * The MIME type PrintQ records for a file of this extension.
+ *
+ * Used where the server establishes the type itself rather than repeating
+ * whatever the browser claimed.
+ */
+export function canonicalMimeFor(ext: string): string {
+  return MIMES_BY_EXTENSION[ext.toLowerCase()]?.[0] ?? "application/octet-stream";
+}
+
 export interface FileValidationResult {
   ok: boolean;
   error?: string;

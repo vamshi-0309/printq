@@ -61,3 +61,22 @@ export function parsePageRange(input: string, totalPages: number): PageRangeResu
 export function allPages(totalPages: number): number[] {
   return Array.from({ length: totalPages }, (_, i) => i + 1);
 }
+
+/** Compact "1-3, 7, 10-12" for a set of page numbers. */
+export function pagesToRangeString(pages: number[]): string {
+  if (pages.length === 0) return "";
+  const sorted = [...new Set(pages)].sort((a, b) => a - b);
+  const parts: string[] = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+
+  for (let i = 1; i <= sorted.length; i++) {
+    const current = sorted[i];
+    if (current !== prev + 1) {
+      parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+      start = current;
+    }
+    prev = current;
+  }
+  return parts.join(",");
+}

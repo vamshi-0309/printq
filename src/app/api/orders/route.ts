@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { calculatePrice, type ShopPricingConfig, PricingError } from "@/lib/pricing";
-import { parsePageRange } from "@/lib/pageRange";
+import { parsePageRange, pagesToRangeString } from "@/lib/pageRange";
+import { verifyStoredDocument } from "@/lib/orderDocument";
+import { downloadFile, StorageObjectMissing } from "@/lib/storage";
 import { createServiceRoleClient } from "@/lib/supabase/server";
 import { createCashfreeOrder, getCashfreeConfig, CashfreeError } from "@/lib/cashfree";
 
@@ -9,9 +11,12 @@ const orderSchema = z.object({
   shopId: z.string().uuid(),
   fileStoragePath: z.string().min(1),
   originalFilename: z.string().min(1),
-  mimeType: z.string().min(1),
-  sizeBytes: z.number().int().min(1),
-  pageCount: z.number().int().min(1),
+  // Still accepted so existing clients keep working, but never used for
+  // anything billed or printed: the server establishes all three from the
+  // stored file itself. See src/lib/orderDocument.ts.
+  mimeType: z.string().optional(),
+  sizeBytes: z.number().int().optional(),
+  pageCount: z.number().int().optional(),
   copies: z.number().int().min(1).max(500),
   colorMode: z.enum(["bw", "color"]),
   paperSize: z.enum(["A4", "A3"]),
@@ -61,16 +66,53 @@ export async function POST(req: NextRequest) {
     enabledPaperSizes: pricing.enabled_paper_sizes,
   };
 
-  // 3. Validate page range
+  // 3. Establish what was actually uploaded. The page count, size and type
+  // all come from the stored object -- never from the request -- because they
+  // decide the price and what the agent prints. The client's pageCount used to
+  // be trusted here, which let a 100-page PDF be ordered as one page.
+  let documentFacts;
+  try {
+    documentFacts = await verifyStoredDocument(
+      data.shopId,
+      data.fileStoragePath,
+      downloadFile,
+      (err) => err instanceof StorageObjectMissing
+    );
+  } catch (err) {
+    console.error(
+      `[orders] shop=${data.shopId} could not read upload: ${err instanceof Error ? err.message : err}`
+    );
+    return NextResponse.json(
+      { error: "We couldn't read your upload just now. Please try again." },
+      { status: 503 }
+    );
+  }
+
+  if (!documentFacts.ok) {
+    return NextResponse.json(
+      { error: documentFacts.message, code: documentFacts.code },
+      { status: documentFacts.code === "bad_path" ? 400 : 422 }
+    );
+  }
+
+  const totalPages = documentFacts.pageCount;
+
+  // 4. Validate the page range against the REAL page count.
   const rangeResult = parsePageRange(
-    data.pageRange === "all" ? `1-${data.pageCount}` : data.pageRange,
-    data.pageCount
+    data.pageRange === "all" ? `1-${totalPages}` : data.pageRange,
+    totalPages
   );
   if (!rangeResult.ok) {
     return NextResponse.json({ error: rangeResult.error }, { status: 400 });
   }
 
-  // 4. Server-authoritative price calculation
+  // What is stored is exactly what was priced, so the agent cannot print more
+  // than was paid for. "all" is kept only when it genuinely means every page
+  // of the verified document, which keeps the common case unchanged.
+  const printedRange =
+    rangeResult.pages.length === totalPages ? "all" : pagesToRangeString(rangeResult.pages);
+
+  // 5. Server-authoritative price calculation
   let breakdown;
   try {
     breakdown = calculatePrice(
@@ -90,7 +132,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Price calculation failed." }, { status: 500 });
   }
 
-  // 5. Create order row
+  // 6. Create order row
   const { data: order, error: orderError } = await supabase
     .from("orders")
     .insert({
@@ -100,7 +142,7 @@ export async function POST(req: NextRequest) {
       orientation: data.orientation,
       sides: data.sides,
       copies: data.copies,
-      page_range: data.pageRange,
+      page_range: printedRange,
       page_count: rangeResult.pages.length,
       price_breakdown: breakdown,
       amount: breakdown.total,
@@ -118,12 +160,15 @@ export async function POST(req: NextRequest) {
   }
 
   // 6. Create order_files row
+  // Type and size are the server's measurements. The filename is the
+  // customer's, kept for display only -- the agent sanitises it before it
+  // ever touches a disk.
   await supabase.from("order_files").insert({
     order_id: order.id,
-    original_filename: data.originalFilename,
+    original_filename: data.originalFilename.slice(0, 255),
     storage_path: data.fileStoragePath,
-    mime_type: data.mimeType,
-    size_bytes: data.sizeBytes,
+    mime_type: documentFacts.mimeType,
+    size_bytes: documentFacts.sizeBytes,
   });
 
   // 7. Create payment row
