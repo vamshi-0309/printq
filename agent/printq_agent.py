@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -115,6 +116,18 @@ class NoPrinterConfigured(RuntimeError):
     """The shop has queued work but no PrintQ printer chosen."""
 
 
+class PrinterProblem(NoPrinterConfigured):
+    """
+    The chosen printer reports a problem (out of paper, jam, cover open...),
+    so the server is holding the shop's jobs in the queue until it is fixed.
+    A subclass so existing handling of "no usable printer" still applies.
+    """
+
+
+class InteractivePrinterPort(PrinterUnavailable):
+    """The printer would stop and ask where to save the output."""
+
+
 class SumatraNotFound(RuntimeError):
     """The SumatraPDF executable could not be located on this machine."""
 
@@ -143,7 +156,7 @@ class PrintQClient:
             "User-Agent": user_agent(),
         }
 
-    def heartbeat(self, printers: list[dict], hostname: str = "") -> dict:
+    def heartbeat(self, printers: list[dict], hostname: str = "", spooler_ok: bool = True) -> dict:
         resp = self.session.post(
             f"{self.base_url}/api/agent/heartbeat",
             headers=self._headers(),
@@ -151,6 +164,7 @@ class PrintQClient:
                 "printers": printers,
                 "agent_version": AGENT_VERSION,
                 "hostname": hostname,
+                "spooler_ok": spooler_ok,
             },
             timeout=10,
         )
@@ -173,6 +187,8 @@ class PrintQClient:
         # reported distinctly instead of being retried as a failure.
         if resp.status_code == 409:
             body = resp.json() if resp.content else {}
+            if body.get("code") == "printer_problem":
+                raise PrinterProblem(body.get("error") or "The printer reports a problem.")
             raise NoPrinterConfigured(body.get("error") or "No PrintQ printer is configured.")
 
         resp.raise_for_status()
@@ -187,11 +203,16 @@ class PrintQClient:
             timeout=10,
         ).raise_for_status()
 
-    def report_result(self, job_id: str, result: str, error_message: str = "") -> None:
+    def report_result(
+        self, job_id: str, result: str, error_message: str = "", error_code: str | None = None
+    ) -> None:
+        payload = {"result": result, "error_message": error_message}
+        if error_code:
+            payload["error_code"] = error_code
         self.session.post(
             f"{self.base_url}/api/agent/jobs/{job_id}/result",
             headers=self._headers(),
-            json={"result": result, "error_message": error_message},
+            json=payload,
             timeout=10,
         ).raise_for_status()
 
@@ -244,6 +265,78 @@ def printer_port(name: str) -> str:
     except Exception as exc:  # unknown printer, access denied, driver oddity
         log.debug("Could not read the port for %r: %s", name, exc)
         return ""
+
+
+# Spooler status bits (PRINTER_STATUS_*) and the "Use Printer Offline" attribute.
+_STATUS_ERROR = 0x00000002
+_STATUS_PAPER_JAM = 0x00000008
+_STATUS_PAPER_OUT = 0x00000010
+_STATUS_PAPER_PROBLEM = 0x00000040
+_STATUS_OFFLINE = 0x00000080
+_STATUS_NOT_AVAILABLE = 0x00001000
+_STATUS_USER_INTERVENTION = 0x00100000
+_STATUS_DOOR_OPEN = 0x00400000
+_ATTRIBUTE_WORK_OFFLINE = 0x00000400
+
+
+def status_from_flags(status: int, attributes: int = 0) -> str:
+    """
+    One problem code for a printer's spooler status, or "ready".
+
+    Most specific first: a jammed printer is usually also "in error", and the
+    owner needs to know it is the jam. Codes match src/lib/printerHealth.ts.
+    """
+    status = int(status or 0)
+    attributes = int(attributes or 0)
+    if status & _STATUS_PAPER_JAM:
+        return "paper_jam"
+    if status & (_STATUS_PAPER_OUT | _STATUS_PAPER_PROBLEM):
+        return "out_of_paper"
+    if status & _STATUS_DOOR_OPEN:
+        return "cover_open"
+    if status & _STATUS_OFFLINE or attributes & _ATTRIBUTE_WORK_OFFLINE:
+        return "offline"
+    if status & _STATUS_NOT_AVAILABLE:
+        return "unavailable"
+    if status & (_STATUS_ERROR | _STATUS_USER_INTERVENTION):
+        return "error"
+    return "ready"
+
+
+def printer_status(name: str) -> str:
+    """
+    What the Windows spooler says about this printer right now.
+
+    Read on its own, like printer_port(), so printer discovery is unchanged.
+    Anything unreadable is reported as "ready": a status we cannot read must
+    not stop a shop printing. Many USB printers never tell the spooler they
+    are out of paper; for those, problems surface as a failed job instead.
+    """
+    if win32print is None:
+        return "ready"
+    try:
+        handle = win32print.OpenPrinter(name)
+        try:
+            info = win32print.GetPrinter(handle, 2)
+            if not isinstance(info, dict):
+                return "ready"
+            return status_from_flags(info.get("Status", 0), info.get("Attributes", 0))
+        finally:
+            win32print.ClosePrinter(handle)
+    except Exception as exc:
+        log.debug("Could not read the status of %r: %s", name, exc)
+        return "ready"
+
+
+def spooler_available() -> bool:
+    """False when the Windows print spooler cannot be reached at all."""
+    if win32print is None:
+        return True
+    try:
+        win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)
+        return True
+    except Exception:
+        return False
 
 
 def list_installed_printers() -> list[dict]:
@@ -325,7 +418,80 @@ def build_sumatra_settings(settings: dict) -> str:
     paper = settings.get("paperSize")
     if paper:
         parts.append(f"paper={paper}")
+    # Both only when the server sends them, so an older server's jobs print
+    # exactly as before. "auto" orientation leaves SumatraPDF to decide.
+    orientation = settings.get("orientation")
+    if orientation in ("portrait", "landscape"):
+        parts.append(orientation)
+    fit = settings.get("fitMode")
+    if fit == "fit":
+        parts.append("fit")
+    elif fit == "actual":
+        parts.append("noscale")
     return ",".join(parts)
+
+
+_PAGE_RANGE_RE = re.compile(r"^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$")
+
+
+def print_passes(settings: dict) -> list[dict]:
+    """
+    The SumatraPDF runs one job needs.
+
+    A single-mode order is one run, with its settings untouched. A mixed-colour
+    order arrives with `colorSegments` -- page runs in page order, each black &
+    white or colour -- and is printed as one run per segment, using the same
+    send_to_printer as any other job. Copies are made by repeating the whole
+    sequence, so each copy comes out collated rather than all copies of page 1
+    first.
+
+    The segments come from the server, computed by the same code that priced
+    the order, so what prints in colour is exactly what was billed as colour.
+    """
+    segments = settings.get("colorSegments") or []
+    if len(segments) < 2:
+        return [settings]
+
+    for seg in segments:
+        if seg.get("colorMode") not in ("bw", "color") or not _PAGE_RANGE_RE.match(str(seg.get("pageRange", ""))):
+            raise ValueError(f"Invalid print segment from server: {seg!r}")
+
+    try:
+        copies = max(1, int(settings.get("copies") or 1))
+    except (TypeError, ValueError):
+        copies = 1
+
+    passes = []
+    for _ in range(copies):
+        for seg in segments:
+            run = {k: v for k, v in settings.items() if k != "colorSegments"}
+            run["pageRange"] = seg["pageRange"]
+            run["colorMode"] = seg["colorMode"]
+            run["copies"] = 1
+            passes.append(run)
+    return passes
+
+
+def classify_print_error(exc: BaseException, printer_name: str = "") -> str:
+    """
+    A machine-readable reason for a failed print, so the dashboard can tell
+    "out of paper" from "printer not installed". Codes match
+    src/lib/printerHealth.ts; the server ignores any it does not know.
+    """
+    if isinstance(exc, SumatraNotFound):
+        return "sumatra_missing"
+    if isinstance(exc, InteractivePrinterPort):
+        return "interactive_port"
+    if isinstance(exc, PrinterUnavailable):
+        return "printer_unavailable"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    # The printer refused the document. If the spooler can say why, say that.
+    if printer_name:
+        status = printer_status(printer_name)
+        if status != "ready":
+            return status
+    return "printer_rejected"
 
 
 def resolve_job_printer(
@@ -394,7 +560,7 @@ def check_printer_can_print_unattended(
         return
 
     shown = label or printer_name
-    raise PrinterUnavailable(
+    raise InteractivePrinterPort(
         f"{shown} saves to a file and makes Windows ask where to put it "
         f"(port {port.strip()}), so PrintQ cannot print to it unattended - "
         "the job stops waiting for a Save-as dialog nobody is there to answer. "
@@ -673,15 +839,32 @@ def process_job(client: PrintQClient, job: PrintJob, cfg: AgentConfig) -> None:
     else:
         pdf_path = downloaded
 
+    # Worked out before the attempt is reported: a malformed plan fails here,
+    # before anything could reach the printer.
+    passes = print_passes(job.printSettings)
+
     # The printer id goes with the attempt so print_attempts records which
     # device the job was actually sent to.
+    #
+    # This call is the gate against printing twice. The server accepts it
+    # only while the job is still CLAIMED by this agent; a duplicate report,
+    # or a job the owner changed or cancelled meanwhile, gets 409 and
+    # raise_for_status stops us here, before send_to_printer.
     client.report_print_attempted(job.jobId, printer_id=printer_id)
 
+    done = 0
     try:
-        send_to_printer(pdf_path, job.printSettings, cfg, printer_name)
+        for run in passes:
+            send_to_printer(pdf_path, run, cfg, printer_name)
+            done += 1
     except Exception as exc:
         log.exception("Print failed for job %s", job.jobId)
-        client.report_result(job.jobId, "error", str(exc))
+        message = str(exc)
+        if len(passes) > 1:
+            message = f"Stopped after {done} of {len(passes)} print passes: {message}"
+        client.report_result(
+            job.jobId, "error", message, error_code=classify_print_error(exc, printer_name)
+        )
         return
 
     client.report_result(job.jobId, "confirmed")

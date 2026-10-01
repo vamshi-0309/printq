@@ -168,7 +168,14 @@ class AgentService:
             if now - last_heartbeat >= core.HEARTBEAT_INTERVAL_SECONDS:
                 try:
                     printers = core.list_installed_printers()
-                    reply = client.heartbeat(printers, hostname)
+                    # Each printer's condition, read separately from
+                    # discovery, so the server can hold jobs while a printer
+                    # is out of paper instead of failing them.
+                    for p in printers:
+                        p["status"] = core.printer_status(p["system_name"])
+                    reply = client.heartbeat(
+                        printers, hostname, spooler_ok=core.spooler_available()
+                    )
                     last_heartbeat = now
                     self._update(
                         state="connected",
@@ -200,13 +207,19 @@ class AgentService:
                 job = client.claim_next_job()
                 warned_no_printer = False
             except core.NoPrinterConfigured as exc:
-                # Work is waiting but the shop has not chosen a printer. Said
-                # once rather than every five seconds.
+                # Work is waiting but the shop has not chosen a printer, or
+                # the chosen one reports a problem. Said once rather than
+                # every five seconds.
                 if not warned_no_printer:
                     core.log.error("%s", exc)
                     self._note("failed", str(exc))
                     warned_no_printer = True
-                self._update(state="no_printer", detail="No printer selected in PrintQ")
+                detail = (
+                    str(exc)[:120]
+                    if isinstance(exc, core.PrinterProblem)
+                    else "No printer selected in PrintQ"
+                )
+                self._update(state="no_printer", detail=detail)
                 job = None
             except requests.RequestException as exc:
                 core.log.warning("Job poll failed: %s", exc)
