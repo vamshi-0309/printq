@@ -3,7 +3,10 @@ import { requireShop } from "@/lib/shopAuth";
 import { evaluateShopReadiness } from "@/lib/shopReadiness";
 import { deriveOrderState } from "@/lib/orderStatus";
 import type { JobState } from "@/lib/jobState";
-import { availableActions } from "@/lib/orderActions";
+import { availableActions, refundableAmount } from "@/lib/orderActions";
+import { moneyHeld, type PaymentRow, PAYMENT_COLUMNS } from "@/lib/orderMoney";
+import { selectPrinterForShop } from "@/lib/printerSelection";
+import { printerProblemLabel, PRINT_ERROR_LABELS } from "@/lib/printerHealth";
 
 /**
  * One order, in full, for the shop that owns it.
@@ -52,23 +55,50 @@ export async function GET(
         .order("created_at", { ascending: true }),
       db
         .from("payments")
-        .select("id, method, gateway, gateway_payment_id, amount, status, created_at, verified_at")
+        .select(`${PAYMENT_COLUMNS}, gateway_payment_id, verified_at, refunded_at`)
         .eq("order_id", orderId)
-        .order("created_at", { ascending: false })
-        .maybeSingle(),
+        .order("created_at", { ascending: true }),
       db
         .from("print_jobs")
         .select("id, state, claimed_by_agent_id, claimed_at, created_at")
         .eq("order_id", orderId)
         .maybeSingle(),
       db.from("queue_entries").select("position, created_at").eq("order_id", orderId).maybeSingle(),
-      db.from("shop_settings").select("heartbeat_timeout_seconds").eq("shop_id", shopId).maybeSingle(),
+      db
+        .from("shop_settings")
+        .select("heartbeat_timeout_seconds, payment_gateway")
+        .eq("shop_id", shopId)
+        .maybeSingle(),
       db
         .from("print_agents")
         .select("id, hostname, version, last_heartbeat_at, created_at")
         .eq("shop_id", shopId),
-      db.from("printers").select("id, is_enabled, is_default, last_status").eq("shop_id", shopId),
+      db
+        .from("printers")
+        .select("id, shop_id, system_name, display_name, is_enabled, is_default, supports_color, supports_duplex, agent_id, last_status")
+        .eq("shop_id", shopId),
     ]);
+
+  const printerRows = printersRes.data ?? [];
+  const chosen = selectPrinterForShop(printerRows, shopId);
+  const printerProblem = chosen.ok
+    ? printerProblemLabel(printerRows.find((p) => p.id === chosen.printer.id)?.last_status)
+    : null;
+  // The printer this order was (or will be) sent to: the one the claim
+  // recorded, else the shop's current choice.
+  const assigned = order.printer_id
+    ? printerRows.find((p) => p.id === order.printer_id)
+    : chosen.ok
+      ? printerRows.find((p) => p.id === chosen.printer.id)
+      : null;
+
+  const paymentRows = (paymentRes.data ?? []) as (PaymentRow & {
+    gateway_payment_id: string | null;
+    verified_at: string | null;
+    refunded_at: string | null;
+  })[];
+  const held = moneyHeld(paymentRows);
+  const refundable = refundableAmount(order.print_status, Number(order.amount ?? 0), held);
 
   const readiness = evaluateShopReadiness({
     shopStatus: "active",
@@ -88,6 +118,9 @@ export async function GET(
     printerAvailable: readiness.printerAvailable,
     completedAt: order.completed_at,
     failureReason: order.failure_reason,
+    printStartedAt: order.print_started_at,
+    printerProblem,
+    now,
   });
 
   // Attempt history is the evidence behind any "printing"/"done" claim, so the
@@ -96,10 +129,13 @@ export async function GET(
   if (jobRes.data?.id) {
     const { data } = await db
       .from("print_attempts")
-      .select("attempt_number, attempted_at, result, error_message, printer_id")
+      .select("attempt_number, attempted_at, result, error_message, error_code, printer_id")
       .eq("print_job_id", jobRes.data.id)
       .order("attempt_number", { ascending: true });
-    attempts = data ?? [];
+    attempts = (data ?? []).map((a) => ({
+      ...a,
+      error_label: a.error_code ? (PRINT_ERROR_LABELS[a.error_code] ?? null) : null,
+    }));
   }
 
   const file = fileRes.data?.[0] ?? null;
@@ -119,6 +155,8 @@ export async function GET(
       paperSize: order.paper_size,
       orientation: order.orientation,
       sides: order.sides,
+      colorRanges: order.color_ranges ?? null,
+      fitMode: order.fit_mode ?? "fit",
       paymentStatus: order.payment_status,
       printStatus: order.print_status,
       createdAt: order.created_at,
@@ -139,18 +177,39 @@ export async function GET(
           uploadedAt: file.created_at,
         }
       : null,
-    payment: paymentRes.data
+    payment: paymentRows.length
       ? {
-          method: paymentRes.data.method,
-          gateway: paymentRes.data.gateway,
+          method: paymentRows[0].method,
+          gateway: paymentRows[0].gateway,
           // The gateway's own reference, useful for reconciliation. Not a secret.
-          reference: paymentRes.data.gateway_payment_id,
-          amount: Number(paymentRes.data.amount ?? 0),
-          status: paymentRes.data.status,
-          createdAt: paymentRes.data.created_at,
-          verifiedAt: paymentRes.data.verified_at,
+          reference: paymentRows[0].gateway_payment_id,
+          amount: Number(paymentRows[0].amount ?? 0),
+          status: paymentRows[0].status,
+          createdAt: paymentRows[0].created_at,
+          verifiedAt: paymentRows[0].verified_at,
         }
       : null,
+    // Every charge on this order: the original, re-issues, top-ups, refunds.
+    payments: paymentRows.map((p) => ({
+      id: p.id,
+      purpose: p.purpose ?? "order",
+      amount: Number(p.amount ?? 0),
+      status: p.status,
+      gateway: p.gateway,
+      cashfreeOrderId: p.cashfree_order_id,
+      reference: p.gateway_payment_id,
+      refundStatus: p.refund_status,
+      refundAmount: p.refund_amount == null ? null : Number(p.refund_amount),
+      createdAt: p.created_at,
+      verifiedAt: p.verified_at,
+      refundedAt: p.refunded_at,
+    })),
+    moneyHeld: held,
+    refundable,
+    printer: assigned
+      ? { id: assigned.id, displayName: assigned.display_name, systemName: assigned.system_name, supportsDuplex: assigned.supports_duplex }
+      : null,
+    shopGateway: settingsRes.data?.payment_gateway ?? null,
     job: jobRes.data
       ? {
           id: jobRes.data.id,
@@ -161,7 +220,12 @@ export async function GET(
       : null,
     queuePosition: queueRes.data?.position ?? null,
     attempts,
-    actions: availableActions(jobState, order.payment_status),
+    actions: availableActions(jobState, order.payment_status, {
+      printStartedAt: order.print_started_at,
+      now,
+      refundableAmount: refundable,
+      gateway: settingsRes.data?.payment_gateway ?? null,
+    }),
     agentOnline: readiness.agentOnline,
     printerAvailable: readiness.printerAvailable,
     serverTime: now.toISOString(),

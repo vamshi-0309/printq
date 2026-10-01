@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateAgent } from "../../../auth";
 import { createServiceRoleClient } from "@/lib/supabase/server";
+import { KNOWN_PRINT_ERROR_CODES, PRINT_ERROR_LABELS } from "@/lib/printerHealth";
 
 /**
  * Record the outcome against the attempt this report belongs to.
@@ -13,7 +14,7 @@ import { createServiceRoleClient } from "@/lib/supabase/server";
 async function recordAttemptOutcome(
   supabase: ReturnType<typeof createServiceRoleClient>,
   jobId: string,
-  patch: { result: string; error_message?: string | null }
+  patch: { result: string; error_message?: string | null; error_code?: string | null }
 ): Promise<void> {
   const { data: latest } = await supabase
     .from("print_attempts")
@@ -48,7 +49,14 @@ export async function POST(
   }
 
   const result: string = body.result;
-  const errorMessage: string = body.error_message ?? "";
+  const errorMessage: string = String(body.error_message ?? "").slice(0, 1000);
+  // A machine-readable class of failure, so "out of paper" and "printer
+  // offline" can be told apart on the dashboard. Unknown codes are dropped
+  // rather than stored: the agent reports, it does not define vocabulary.
+  const errorCode: string | null =
+    typeof body.error_code === "string" && KNOWN_PRINT_ERROR_CODES.has(body.error_code)
+      ? body.error_code
+      : null;
 
   const supabase = createServiceRoleClient();
 
@@ -72,11 +80,17 @@ export async function POST(
   }
 
   if (result === "confirmed") {
-    // Mark job as completed
-    await supabase
+    // Mark job as completed — only from the state just read, so a duplicate
+    // report or an owner's decision in the meantime is not overwritten.
+    const { data: moved } = await supabase
       .from("print_jobs")
       .update({ state: "COMPLETED" })
-      .eq("id", jobId);
+      .eq("id", jobId)
+      .eq("state", job.state)
+      .select("id");
+    if (!moved || moved.length === 0) {
+      return NextResponse.json({ error: "This job changed; result not applied." }, { status: 409 });
+    }
 
     await supabase
       .from("orders")
@@ -84,7 +98,8 @@ export async function POST(
         print_status: "completed",
         completed_at: new Date().toISOString(),
       })
-      .eq("id", job.order_id);
+      .eq("id", job.order_id)
+      .eq("shop_id", auth.shopId);
 
     await recordAttemptOutcome(supabase, jobId, { result: "confirmed", error_message: null });
 
@@ -98,22 +113,33 @@ export async function POST(
   }
 
   if (result === "error") {
-    await supabase
+    const { data: moved } = await supabase
       .from("print_jobs")
       .update({ state: "FAILED" })
-      .eq("id", jobId);
+      .eq("id", jobId)
+      .eq("state", job.state)
+      .select("id");
+    if (!moved || moved.length === 0) {
+      return NextResponse.json({ error: "This job changed; result not applied." }, { status: 409 });
+    }
 
+    const label = errorCode ? PRINT_ERROR_LABELS[errorCode] : null;
     await supabase
       .from("orders")
       .update({
         print_status: "failed",
-        failure_reason: errorMessage,
+        failure_reason: label && !errorMessage.startsWith(label) ? `${label}. ${errorMessage}` : errorMessage,
       })
-      .eq("id", job.order_id);
+      .eq("id", job.order_id)
+      .eq("shop_id", auth.shopId);
 
-    await recordAttemptOutcome(supabase, jobId, { result: "error", error_message: errorMessage });
+    await recordAttemptOutcome(supabase, jobId, {
+      result: "error",
+      error_message: errorMessage,
+      error_code: errorCode,
+    });
 
-    return NextResponse.json({ status: "failed", error_message: errorMessage });
+    return NextResponse.json({ status: "failed", error_message: errorMessage, error_code: errorCode });
   }
 
   return NextResponse.json({ error: "Unknown result value." }, { status: 400 });

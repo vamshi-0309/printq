@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireShop } from "@/lib/shopAuth";
 import { evaluateShopReadiness } from "@/lib/shopReadiness";
 import { deriveOrderState, matchesFilter, ORDER_FILTERS } from "@/lib/orderStatus";
+import { selectPrinterForShop } from "@/lib/printerSelection";
+import { printerProblemLabel } from "@/lib/printerHealth";
 
 /**
  * The shop's order history, filtered and paged.
@@ -32,7 +34,7 @@ const COARSE_PRINT_STATUS: Record<string, string[] | null> = {
   printing: ["print_attempted", "printing"],
   completed: ["completed"],
   // Everything that could derive to blocked; narrowed exactly in JS below.
-  needs_attention: ["paid", "queued", "failed", "held"],
+  needs_attention: ["paid", "queued", "failed", "held", "print_attempted", "printing", "pending_approval"],
 };
 
 export async function GET(req: NextRequest) {
@@ -58,8 +60,16 @@ export async function GET(req: NextRequest) {
   const [settingsRes, agentsRes, printersRes] = await Promise.all([
     db.from("shop_settings").select("heartbeat_timeout_seconds").eq("shop_id", shopId).maybeSingle(),
     db.from("print_agents").select("id, hostname, version, last_heartbeat_at, created_at").eq("shop_id", shopId),
-    db.from("printers").select("id, is_enabled, is_default, last_status").eq("shop_id", shopId),
+    db
+      .from("printers")
+      .select("id, shop_id, system_name, display_name, is_enabled, is_default, supports_color, supports_duplex, agent_id, last_status")
+      .eq("shop_id", shopId),
   ]);
+
+  const chosen = selectPrinterForShop(printersRes.data ?? [], shopId);
+  const printerProblem = chosen.ok
+    ? printerProblemLabel((printersRes.data ?? []).find((p) => p.id === chosen.printer.id)?.last_status)
+    : null;
 
   const readiness = evaluateShopReadiness({
     shopStatus: "active", // Order display does not depend on shop status.
@@ -72,7 +82,7 @@ export async function GET(req: NextRequest) {
   let query = db
     .from("orders")
     .select(
-      "id, public_order_id, token_number, payment_status, print_status, amount, page_count, copies, color_mode, paper_size, sides, page_range, created_at, paid_at, completed_at, failure_reason"
+      "id, public_order_id, token_number, payment_status, print_status, amount, page_count, copies, color_mode, paper_size, sides, page_range, created_at, paid_at, completed_at, failure_reason, print_started_at"
     )
     .eq("shop_id", shopId)
     .order("created_at", { ascending: false })
@@ -82,9 +92,9 @@ export async function GET(req: NextRequest) {
   if (coarse) {
     query = query.in("print_status", coarse);
   } else if (filter === "awaiting_payment") {
-    query = query.eq("payment_status", "pending");
+    query = query.or("payment_status.eq.pending,print_status.eq.awaiting_topup");
   } else if (filter === "closed") {
-    query = query.or("print_status.in.(failed,cancelled),payment_status.in.(failed,expired)");
+    query = query.or("print_status.in.(failed,cancelled,rejected),payment_status.in.(failed,expired)");
   }
 
   if (before) {
@@ -144,6 +154,9 @@ export async function GET(req: NextRequest) {
         printerAvailable: readiness.printerAvailable,
         completedAt: o.completed_at,
         failureReason: o.failure_reason,
+        printStartedAt: o.print_started_at,
+        printerProblem,
+        now,
       }),
     }))
     .filter((o) => matchesFilter(filter, o.state.key));

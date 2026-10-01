@@ -1,6 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateAgent } from "../auth";
 import { createServiceRoleClient } from "@/lib/supabase/server";
+import { PRINTER_PROBLEMS } from "@/lib/printerHealth";
+import { purgeExpiredFiles } from "@/lib/jobMaintenance";
+import { deleteFile } from "@/lib/storage";
+import { cashfreeGateway } from "@/lib/orderMoney";
+
+/** A status code the agent may report; anything else is stored as "ready". */
+function reportedStatus(raw: unknown): string {
+  return typeof raw === "string" && raw in PRINTER_PROBLEMS ? raw : "ready";
+}
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateAgent(req);
@@ -11,7 +20,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid body." }, { status: 400 });
   }
 
-  const printers: { system_name: string; is_default: boolean; supports_color?: boolean; supports_duplex?: boolean }[] = body.printers ?? [];
+  const printers: {
+    system_name: string;
+    is_default: boolean;
+    supports_color?: boolean;
+    supports_duplex?: boolean;
+    /** Agent 1.1+: the spooler's view of this printer, e.g. "out_of_paper". */
+    status?: string;
+  }[] = body.printers ?? [];
   const agentVersion: string = body.agent_version ?? "unknown";
   const hostname: string = body.hostname ?? "";
 
@@ -29,7 +45,7 @@ export async function POST(req: NextRequest) {
     .eq("id", auth.agentId)
     .eq("shop_id", auth.shopId);
 
-  // Upsert printers. Errors are collected rather than ignored: this silently
+  // Save printers. Errors are collected rather than ignored: this silently
   // failed for every printer because no unique constraint matched the
   // ON CONFLICT target, and the 200 response hid it completely.
   //
@@ -37,22 +53,49 @@ export async function POST(req: NextRequest) {
   // Windows considers default, and overwriting on every heartbeat would undo
   // the shop owner's choice within 20 seconds of them making it. The owner's
   // selection wins; Windows only seeds it below when nothing is set yet.
+  //
+  // `display_name` is the same: it is set once, when a printer is first seen,
+  // and after that belongs to the owner, who can rename it. It used to be
+  // rewritten to the Windows name on every heartbeat. `system_name` — the
+  // exact Windows name the agent prints to — is never changed by a rename.
+  const { data: knownRows } = await supabase
+    .from("printers")
+    .select("system_name")
+    .eq("shop_id", auth.shopId);
+  const known = new Set((knownRows ?? []).map((r) => r.system_name as string));
+
   const printerErrors: string[] = [];
   for (const p of printers) {
-    const { error: printerError } = await supabase.from("printers").upsert(
-      {
-        shop_id: auth.shopId,
-        agent_id: auth.agentId,
-        system_name: p.system_name,
-        display_name: p.system_name,
-        supports_color: p.supports_color ?? false,
-        supports_duplex: p.supports_duplex ?? false,
-        last_status: "ready",
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "shop_id,system_name", ignoreDuplicates: false }
-    );
+    const fields = {
+      shop_id: auth.shopId,
+      agent_id: auth.agentId,
+      system_name: p.system_name,
+      supports_color: p.supports_color ?? false,
+      supports_duplex: p.supports_duplex ?? false,
+      last_status: reportedStatus(p.status),
+      updated_at: new Date().toISOString(),
+    };
+    const { error: printerError } = known.has(p.system_name)
+      ? await supabase
+          .from("printers")
+          .update(fields)
+          .eq("shop_id", auth.shopId)
+          .eq("system_name", p.system_name)
+      : await supabase
+          .from("printers")
+          .upsert({ ...fields, display_name: p.system_name }, { onConflict: "shop_id,system_name", ignoreDuplicates: false });
     if (printerError) printerErrors.push(`${p.system_name}: ${printerError.message}`);
+  }
+
+  // The agent could not reach the Windows print spooler at all, so it listed
+  // no printers. Say so on this agent's printers rather than leaving them
+  // looking ready.
+  if (body.spooler_ok === false) {
+    await supabase
+      .from("printers")
+      .update({ last_status: "spooler_down", updated_at: new Date().toISOString() })
+      .eq("shop_id", auth.shopId)
+      .eq("agent_id", auth.agentId);
   }
 
   if (printerErrors.length > 0) {
@@ -102,6 +145,30 @@ export async function POST(req: NextRequest) {
     .eq("is_default", true)
     .eq("is_enabled", true)
     .maybeSingle();
+
+  // Retention: delete this shop's expired customer files, a small batch per
+  // heartbeat. Never allowed to fail the heartbeat itself.
+  try {
+    const { data: retention } = await supabase
+      .from("shop_settings")
+      .select("file_retention_hours")
+      .eq("shop_id", auth.shopId)
+      .maybeSingle();
+    const gateway = cashfreeGateway();
+    const purged = await purgeExpiredFiles(
+      supabase,
+      auth.shopId,
+      Number(retention?.file_retention_hours ?? 24),
+      { removeObject: deleteFile, terminateCheckout: gateway ? (id) => gateway.terminate(id) : undefined }
+    );
+    if (purged.deleted > 0 || purged.failed > 0) {
+      console.info(
+        `[retention] shop=${auth.shopId} deleted=${purged.deleted} expired_orders=${purged.expiredOrders} failed=${purged.failed}`
+      );
+    }
+  } catch (err) {
+    console.error(`[retention] shop=${auth.shopId} pass failed: ${err instanceof Error ? err.message : err}`);
+  }
 
   return NextResponse.json({
     status: "ok",

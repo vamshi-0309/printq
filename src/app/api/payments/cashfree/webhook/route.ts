@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServiceRoleClient } from "@/lib/supabase/server";
-import { markOrderPaidAndQueue, markOrderPaymentFailed } from "@/lib/orderPayment";
+import { applyGatewayFailure, applyGatewayPayment } from "@/lib/orderPayment";
+import { cashfreeGateway } from "@/lib/orderMoney";
 import {
   verifyCashfreeWebhook,
   parseCashfreeEvent,
   isSuccessEvent,
   isFailureEvent,
+  isRefundEvent,
 } from "@/lib/cashfreeWebhook";
 
 /**
@@ -24,6 +26,13 @@ import {
  * retrying something that will never succeed. Non-200 is reserved for failed
  * verification (400) and genuine transient faults (500), which are the only
  * cases where a retry could help.
+ *
+ * WHICH PAYMENT
+ * `data.order.order_id` is the Cashfree order id we created, which is no
+ * longer always the order UUID: a top-up is "<uuid>-t1", a re-issued session
+ * "<uuid>-r2". It is resolved through payments.cashfree_order_id, falling
+ * back to the order UUID for orders created before that column existed. See
+ * applyGatewayPayment.
  */
 
 export async function POST(req: NextRequest) {
@@ -71,12 +80,12 @@ export async function POST(req: NextRequest) {
   }
 
   const supabase = createServiceRoleClient();
+  const gateway = cashfreeGateway();
 
   try {
     if (isSuccessEvent(event)) {
-      const result = await markOrderPaidAndQueue(supabase, orderId, {
+      const result = await applyGatewayPayment(supabase, gateway, null, orderId, {
         gatewayPaymentId: event.cfPaymentId ?? undefined,
-        gateway: "cashfree",
       });
 
       if (!result.ok) {
@@ -85,33 +94,52 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ received: true, handled: false }, { status: 200 });
       }
 
-      // Store the raw payload for audit only after the signature passed.
+      // Store the raw payload for audit only after the signature passed,
+      // against the one payments row this event is about.
       await supabase
         .from("payments")
         .update({ raw_webhook_payload: payload })
-        .eq("order_id", orderId);
+        .eq("cashfree_order_id", orderId);
 
+      if (result.refundDue) {
+        console.warn(
+          `[cashfree-webhook] order=${result.orderId} holds ${result.refundDue} more than it costs; owner is offered a refund`
+        );
+      }
       console.info(
-        `[cashfree-webhook] order=${orderId} paid alreadyPaid=${result.alreadyPaid} token=${result.tokenNumber ?? "none"}`
+        `[cashfree-webhook] cashfree_order=${orderId} purpose=${result.purpose} paid duplicate=${result.duplicate} token=${result.tokenNumber ?? "none"}`
       );
       return NextResponse.json(
-        { received: true, handled: true, duplicate: result.alreadyPaid },
+        { received: true, handled: true, duplicate: result.duplicate },
         { status: 200 }
       );
     }
 
     if (isFailureEvent(event)) {
-      await markOrderPaymentFailed(
-        supabase,
-        orderId,
-        `Payment ${event.paymentStatus ?? event.type}`
-      );
+      await applyGatewayFailure(supabase, orderId, `Payment ${event.paymentStatus ?? event.type}`);
       await supabase
         .from("payments")
         .update({ raw_webhook_payload: payload })
-        .eq("order_id", orderId);
+        .eq("cashfree_order_id", orderId);
 
-      console.info(`[cashfree-webhook] order=${orderId} marked failed`);
+      console.info(`[cashfree-webhook] cashfree_order=${orderId} marked failed`);
+      return NextResponse.json({ received: true, handled: true }, { status: 200 });
+    }
+
+    if (isRefundEvent(event) && event.refund?.refundId) {
+      // Only the outcome of a refund we started; matched on our refund id.
+      const status = event.refund.status;
+      const next =
+        status === "SUCCESS" ? "succeeded" : status === "CANCELLED" || status === "FAILED" ? "failed" : "pending";
+      await supabase
+        .from("payments")
+        .update({
+          refund_status: next,
+          refunded_at: next === "succeeded" ? new Date().toISOString() : null,
+        })
+        .eq("cashfree_order_id", orderId)
+        .eq("refund_id", event.refund.refundId);
+      console.info(`[cashfree-webhook] refund ${event.refund.refundId} on ${orderId}: ${next}`);
       return NextResponse.json({ received: true, handled: true }, { status: 200 });
     }
 

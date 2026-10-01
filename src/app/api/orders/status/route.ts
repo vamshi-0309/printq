@@ -1,18 +1,32 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createServiceRoleClient } from "@/lib/supabase/server";
+import {
+  buildCustomerStatus,
+  isStatusExpired,
+  queueSnapshot,
+  upiLinkFor,
+  type StatusOrderRow,
+} from "@/lib/customerStatus";
+import { loadPayments, moneyHeld, rupees } from "@/lib/orderMoney";
 
 const statusSchema = z.object({
   orderId: z.string().uuid(),
   customerSessionToken: z.string().uuid(),
 });
 
+export const dynamic = "force-dynamic";
+
 /**
  * Customer-facing order status. Authenticated by the customer_session_token
  * generated when the order was created — no login required.
+ *
+ * What may be returned is fixed in src/lib/customerStatus.ts; this route only
+ * gathers the inputs. Nothing about any other customer is read except the
+ * token of the job at the printer.
  */
 export async function POST(req: NextRequest) {
-  const parsed = statusSchema.safeParse(await req.json());
+  const parsed = statusSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     return NextResponse.json({ error: "Invalid request." }, { status: 400 });
   }
@@ -26,7 +40,6 @@ export async function POST(req: NextRequest) {
       public_order_id,
       shop_id,
       token_number,
-      token_counter,
       payment_status,
       print_status,
       amount,
@@ -34,7 +47,11 @@ export async function POST(req: NextRequest) {
       color_mode,
       paper_size,
       sides,
+      orientation,
       page_count,
+      page_range,
+      color_ranges,
+      fit_mode,
       created_at,
       paid_at,
       completed_at,
@@ -48,41 +65,44 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
 
-  // Get queue position if the order is in an active state
-  let queuePosition: number | null = null;
-  if (["queued", "claimed", "printing", "print_attempted"].includes(order.print_status)) {
-    const { data: entry } = await supabase
-      .from("queue_entries")
-      .select("position")
+  const [{ data: shop }, { data: settings }, { data: file }, payments, queue] = await Promise.all([
+    supabase.from("shops").select("shop_name").eq("id", order.shop_id).single(),
+    supabase.from("shop_settings").select("upi_id, payment_gateway").eq("shop_id", order.shop_id).maybeSingle(),
+    supabase
+      .from("order_files")
+      .select("deleted_at")
       .eq("order_id", order.id)
-      .single();
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle(),
+    loadPayments(supabase, order.id),
+    queueSnapshot(supabase, order.shop_id, order.id),
+  ]);
 
-    queuePosition = entry?.position ?? null;
+  // Past retention, or finished more than a day ago: the link has done its
+  // job. Say so plainly rather than showing a stale screen.
+  if (isStatusExpired(order, Boolean(file?.deleted_at), new Date())) {
+    return NextResponse.json(
+      {
+        expired: true,
+        orderId: order.public_order_id,
+        error: "This order link has expired. If you still need help, ask at the counter.",
+      },
+      { status: 410 }
+    );
   }
 
-  // Get shop name for display
-  const { data: shop } = await supabase
-    .from("shops")
-    .select("shop_name")
-    .eq("id", order.shop_id)
-    .single();
+  const owed = rupees(Number(order.amount ?? 0) - moneyHeld(payments));
+  const shopName = shop?.shop_name ?? "";
 
-  return NextResponse.json({
-    orderId: order.public_order_id,
-    shopName: shop?.shop_name,
-    tokenNumber: order.token_number,
-    paymentStatus: order.payment_status,
-    printStatus: order.print_status,
-    amount: order.amount,
-    copies: order.copies,
-    colorMode: order.color_mode,
-    paperSize: order.paper_size,
-    sides: order.sides,
-    pageCount: order.page_count,
-    queuePosition,
-    createdAt: order.created_at,
-    paidAt: order.paid_at,
-    completedAt: order.completed_at,
-    failureReason: order.failure_reason,
-  });
+  return NextResponse.json(
+    buildCustomerStatus({
+      order: order as StatusOrderRow,
+      shopName: shop?.shop_name ?? null,
+      queue,
+      payments,
+      shopGateway: settings?.payment_gateway ?? null,
+      upiLink: owed > 0 ? upiLinkFor(settings?.upi_id, shopName, owed, order.public_order_id) : null,
+    })
+  );
 }

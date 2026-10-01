@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireShop } from "@/lib/shopAuth";
 import { evaluateShopReadiness } from "@/lib/shopReadiness";
+import { printerProblemLabel } from "@/lib/printerHealth";
 
 /**
  * Printers discovered by the shop's agent.
@@ -54,10 +55,16 @@ export async function GET() {
   // "ready" and "this was ready the last time anyone checked".
   const liveAgentIds = new Set(readiness.agents.filter((a) => a.online).map((a) => a.id));
 
+  const hostnameOf = new Map((agentsRes.data ?? []).map((a) => [a.id, a.hostname as string | null]));
+
   const printers = (printersRes.data ?? []).map((p) => ({
     ...p,
     agentOnline: p.agent_id ? liveAgentIds.has(p.agent_id) : false,
     available: p.is_enabled && Boolean(p.agent_id && liveAgentIds.has(p.agent_id)),
+    // Which counter PC reported this printer.
+    agentHostname: p.agent_id ? (hostnameOf.get(p.agent_id) ?? null) : null,
+    // "Out of paper", "Cover or door open"… or null when the spooler is happy.
+    problem: printerProblemLabel(p.last_status),
   }));
 
   const agentRow = readiness.activeAgent;

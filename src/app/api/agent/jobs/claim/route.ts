@@ -4,6 +4,9 @@ import { createServiceRoleClient } from "@/lib/supabase/server";
 import { getSignedDownloadUrl } from "@/lib/storage";
 import { canTransition, type JobState } from "@/lib/jobState";
 import { selectPrinterForShop, type SelectedPrinter } from "@/lib/printerSelection";
+import { requeueStaleClaims } from "@/lib/jobMaintenance";
+import { isPrinterProblem, printerProblemLabel } from "@/lib/printerHealth";
+import { resolvePageColors, parsePageRange, type ColorRange } from "@/lib/pageRange";
 
 /**
  * An agent asking for its next print job.
@@ -56,6 +59,18 @@ import { selectPrinterForShop, type SelectedPrinter } from "@/lib/printerSelecti
  * printed. The chosen printer is also written to orders.printer_id, so the
  * attempt endpoint records what the server assigned instead of trusting what
  * the agent reports back.
+ *
+ * SELF-HEALING
+ * Before looking for work, any of this shop's jobs left CLAIMED for longer
+ * than STALE_CLAIM_SECONDS are put back in the queue (see jobMaintenance.ts).
+ * A crashed agent therefore cannot strand a paid job. Nothing past CLAIMED is
+ * ever touched: a job that may have reached a printer waits for the owner.
+ *
+ * PRINTER PROBLEMS
+ * When the chosen printer reports out of paper, a jam, an open cover or
+ * similar, no job is handed out: 409 with code printer_problem, jobs stay
+ * QUEUED, and the dashboard shows which order is waiting. Another printer is
+ * never substituted.
  */
 
 /**
@@ -85,7 +100,33 @@ interface CandidateJob {
     copies: number;
     page_range: string;
     page_count: number | null;
+    color_ranges: ColorRange[] | null;
+    fit_mode: string | null;
   };
+}
+
+/**
+ * The passes the agent makes for a mixed-colour order: each page range with
+ * its own colour setting, in page order. Null for a single-mode order, which
+ * prints exactly as it always has. Derived from the same resolvePageColors
+ * that priced the order, so what prints in colour is what was billed as
+ * colour.
+ */
+function colorSegmentsFor(order: CandidateJob["orders"]) {
+  if (!order.color_ranges || order.color_ranges.length === 0) return null;
+  const range = order.page_range ?? "all";
+  const numbers = (range.match(/\d+/g) ?? []).map(Number);
+  const documentPages = range === "all" ? (order.page_count ?? 0) : Math.max(order.page_count ?? 0, ...numbers);
+  const selected = parsePageRange(range === "all" ? `1-${documentPages}` : range, documentPages);
+  if (!selected.ok) return null;
+  const colors = resolvePageColors(
+    selected.pages,
+    documentPages,
+    order.color_mode === "color" ? "color" : "bw",
+    order.color_ranges
+  );
+  if (!colors.ok || colors.segments.length < 2) return null;
+  return colors.segments;
 }
 
 /**
@@ -134,6 +175,12 @@ export async function POST(req: NextRequest) {
 
   const supabase = createServiceRoleClient();
 
+  // A job claimed by an agent that then vanished goes back in the line.
+  const requeued = await requeueStaleClaims(supabase, auth.shopId);
+  if (requeued > 0) {
+    console.warn(`[agent-claim] shop=${auth.shopId} requeued ${requeued} stale claim(s)`);
+  }
+
   // Resolve the shop's chosen printer first. There is no point claiming a job
   // for a shop that has nowhere to print it, and claiming one would move it
   // out of QUEUED into a state only a human can leave.
@@ -155,7 +202,7 @@ export async function POST(req: NextRequest) {
   const { data, error } = await supabase
     .from("print_jobs")
     .select(
-      "id, order_id, state, created_at, orders!inner(id, shop_id, payment_status, color_mode, paper_size, orientation, sides, copies, page_range, page_count)"
+      "id, order_id, state, created_at, orders!inner(id, shop_id, payment_status, color_mode, paper_size, orientation, sides, copies, page_range, page_count, color_ranges, fit_mode)"
     )
     .eq("state", "QUEUED")
     .eq("orders.shop_id", auth.shopId)
@@ -192,6 +239,23 @@ export async function POST(req: NextRequest) {
   }
 
   const printer: SelectedPrinter = selection.printer;
+
+  // The chosen printer has told the spooler it can't print. Hand out nothing:
+  // the jobs stay QUEUED, so nothing has been attempted and nothing can be
+  // printed twice once the problem is fixed.
+  const chosenRow = (printerRows ?? []).find((p) => p.id === printer.id);
+  if (isPrinterProblem(chosenRow?.last_status)) {
+    const label = printerProblemLabel(chosenRow?.last_status);
+    return NextResponse.json(
+      {
+        error: `${printer.displayName}: ${label}. Jobs are waiting until it is fixed.`,
+        code: "printer_problem",
+        printerStatus: chosenRow?.last_status,
+        queuedJobs: candidates.length,
+      },
+      { status: 409 }
+    );
+  }
 
   for (const job of candidates) {
     const order = job.orders;
@@ -326,6 +390,10 @@ export async function POST(req: NextRequest) {
         copies: order.copies,
         pageRange: order.page_range,
         pageCount: order.page_count,
+        // "fit" scales each page to the paper; "actual" prints at 100%.
+        fitMode: order.fit_mode ?? "fit",
+        // Mixed colour only: print these passes in order instead of one.
+        colorSegments: colorSegmentsFor(order),
       },
     });
   }

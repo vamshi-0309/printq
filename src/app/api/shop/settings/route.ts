@@ -33,7 +33,7 @@ const SHOP_COLUMNS =
   "id, slug, shop_name, owner_name, phone, email, address, city, state, pincode, gstin, status, created_at";
 
 const SETTINGS_COLUMNS =
-  "shop_id, upi_id, payment_gateway, payment_gateway_account_id, file_retention_hours, heartbeat_timeout_seconds, updated_at";
+  "shop_id, upi_id, payment_gateway, payment_gateway_account_id, file_retention_hours, heartbeat_timeout_seconds, shop_open, accepting_orders, printing_mode, updated_at";
 
 const MIN_RETENTION_HOURS = 1;
 const MAX_RETENTION_HOURS = 168;
@@ -73,11 +73,13 @@ export async function GET() {
 export async function PATCH(req: NextRequest) {
   const auth = await requireShop();
   if (!auth.ok) return auth.response;
-  const { shopId, db } = auth.ctx;
+  const { shopId, userId, db } = auth.ctx;
 
   let body: {
     shop?: Record<string, unknown>;
     settings?: Record<string, unknown>;
+    /** The owner's switches. Saved on their own, without the payment form. */
+    controls?: { shopOpen?: unknown; acceptingOrders?: unknown; printingMode?: unknown };
   };
   try {
     body = await req.json();
@@ -87,6 +89,46 @@ export async function PATCH(req: NextRequest) {
 
   // Things worth telling the owner about that are not reasons to refuse a save.
   const warnings: string[] = [];
+
+  if (body.controls) {
+    const patch: Record<string, unknown> = {};
+    if (typeof body.controls.shopOpen === "boolean") patch.shop_open = body.controls.shopOpen;
+    if (typeof body.controls.acceptingOrders === "boolean") patch.accepting_orders = body.controls.acceptingOrders;
+    if (body.controls.printingMode !== undefined) {
+      if (body.controls.printingMode !== "automatic" && body.controls.printingMode !== "approval_required") {
+        return NextResponse.json({ error: "Unknown printing mode." }, { status: 422 });
+      }
+      patch.printing_mode = body.controls.printingMode;
+    }
+    if (Object.keys(patch).length === 0) {
+      return NextResponse.json({ error: "Nothing to change." }, { status: 400 });
+    }
+
+    // Update, not upsert: every shop has a settings row from registration,
+    // and an upsert here would need every NOT NULL column.
+    const { data: saved, error } = await db
+      .from("shop_settings")
+      .update({ ...patch, updated_at: new Date().toISOString() })
+      .eq("shop_id", shopId)
+      .select("shop_open, accepting_orders, printing_mode");
+    if (error || !saved || saved.length === 0) {
+      return NextResponse.json({ error: "Could not save that change." }, { status: 500 });
+    }
+
+    await db.from("audit_logs").insert({
+      actor_type: "shop_owner",
+      actor_id: userId,
+      shop_id: shopId,
+      action: "shop.controls_changed",
+      target_table: "shop_settings",
+      target_id: shopId,
+      metadata: patch,
+    });
+
+    if (!body.shop && !body.settings) {
+      return NextResponse.json({ ok: true, warnings, controls: saved[0] });
+    }
+  }
 
   if (body.shop) {
     const text = (v: unknown) => {

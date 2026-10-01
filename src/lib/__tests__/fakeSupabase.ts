@@ -21,6 +21,8 @@ export interface FakeDbOptions {
   /** table → list of column groups that must be unique, e.g. [["shop_id","idempotency_key"]] */
   unique?: Record<string, string[][]>;
   rpc?: Record<string, (args: Record<string, unknown>, db: FakeDb) => unknown>;
+  /** Column defaults per table, like Postgres DEFAULTs, applied on insert. */
+  defaults?: Record<string, () => Row>;
 }
 
 let idCounter = 0;
@@ -48,6 +50,7 @@ export class FakeDb {
   tables: Record<string, Row[]> = {};
   rpcHandlers: NonNullable<FakeDbOptions["rpc"]>;
   unique: Record<string, string[][]>;
+  defaults: Record<string, () => Row>;
   /** Every write, in order, for assertions about what a route touched. */
   log: { table: string; op: string; rows: Row[] }[] = [];
 
@@ -57,6 +60,7 @@ export class FakeDb {
     }
     this.rpcHandlers = opts.rpc ?? {};
     this.unique = { ...DEFAULT_UNIQUE, ...(opts.unique ?? {}) };
+    this.defaults = opts.defaults ?? {};
   }
 
   table(name: string): Row[] {
@@ -277,7 +281,7 @@ class Query {
 
     if (this.op === "insert") {
       const rows = (Array.isArray(this.payload) ? this.payload : [this.payload!]).map((r) =>
-        withDefaults(r)
+        withDefaults({ ...(this.db.defaults[this.name]?.() ?? {}), ...r })
       );
       for (const r of rows) this.db.checkUnique(this.name, r);
       table.push(...rows);

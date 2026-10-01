@@ -1,5 +1,6 @@
 import type { DerivedOrderState } from "./orderStatus";
 import type { ShopReadiness } from "./shopReadiness";
+import type { ShopControls } from "./shopControls";
 
 /**
  * The shapes the dashboard API routes return.
@@ -11,6 +12,13 @@ import type { ShopReadiness } from "./shopReadiness";
 export interface OverviewResponse {
   shop: { id: string; slug: string; name: string; city: string | null; status: string };
   readiness: ShopReadiness;
+  controls: ShopControls;
+  printerIssue: {
+    printer: string;
+    problem: string;
+    waitingOrder: string | null;
+    waitingCount: number;
+  } | null;
   settings: {
     paymentGateway: string | null;
     hasUpiId: boolean;
@@ -42,16 +50,40 @@ export interface QueueItem {
   tokenNumber: string | null;
   amount: number;
   pageCount: number | null;
+  pageRange: string;
+  copies: number;
+  colorMode: string;
+  colorRanges: { range: string; mode: "bw" | "color" }[] | null;
+  paperSize: string;
+  sides: string;
+  orientation: string;
+  fitMode: string;
+  printerName: string | null;
+  paymentStatus: string;
+  jobState: string | null;
+  /** Money held for the order after refunds, rupees. */
+  moneyHeld: number;
+  /** What the customer is owed back, rupees. */
+  refundable: number;
+  createdAt: string;
+  paidAt: string | null;
+  printStartedAt: string | null;
+  state: DerivedOrderState;
+  actions: OrderAction[];
+}
+
+export interface OrderListItem {
+  id: string;
+  publicOrderId: string;
+  tokenNumber: string | null;
+  amount: number;
+  pageCount: number | null;
   copies: number;
   colorMode: string;
   paperSize: string;
   sides: string;
   createdAt: string;
-  paidAt: string | null;
   state: DerivedOrderState;
-}
-
-export interface OrderListItem extends Omit<QueueItem, "paidAt"> {
   pageRange: string;
   paidAt: string | null;
   completedAt: string | null;
@@ -94,6 +126,8 @@ export interface OrderDetailResponse {
     paperSize: string;
     orientation: string;
     sides: string;
+    colorRanges: { range: string; mode: "bw" | "color" }[] | null;
+    fitMode: string;
     paymentStatus: string;
     printStatus: string;
     createdAt: string;
@@ -120,6 +154,24 @@ export interface OrderDetailResponse {
     createdAt: string;
     verifiedAt: string | null;
   } | null;
+  payments: {
+    id: string;
+    purpose: string;
+    amount: number;
+    status: string;
+    gateway: string | null;
+    cashfreeOrderId: string | null;
+    reference: string | null;
+    refundStatus: string | null;
+    refundAmount: number | null;
+    createdAt: string;
+    verifiedAt: string | null;
+    refundedAt: string | null;
+  }[];
+  moneyHeld: number;
+  refundable: number;
+  printer: { id: string; displayName: string; systemName: string; supportsDuplex: boolean } | null;
+  shopGateway: string | null;
   job: {
     id: string;
     state: string;
@@ -132,6 +184,8 @@ export interface OrderDetailResponse {
     attempted_at: string;
     result: string | null;
     error_message: string | null;
+    error_code: string | null;
+    error_label: string | null;
     printer_id: string | null;
   }[];
   actions: OrderAction[];
@@ -154,6 +208,8 @@ export interface PrinterRow {
   updated_at: string;
   agentOnline: boolean;
   available: boolean;
+  agentHostname: string | null;
+  problem: string | null;
 }
 
 export interface PrintersResponse {
@@ -225,6 +281,9 @@ export interface SettingsResponse {
     payment_gateway_account_id: string | null;
     file_retention_hours: number;
     heartbeat_timeout_seconds: number;
+    shop_open: boolean;
+    accepting_orders: boolean;
+    printing_mode: "automatic" | "approval_required";
     updated_at: string;
   } | null;
   licence: {

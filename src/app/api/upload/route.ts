@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { createServiceRoleClient } from "@/lib/supabase/server";
 import { MAX_PAGE_COUNT, validateFile } from "@/lib/fileValidation";
 import { countDocumentPages, EncryptedPdfError } from "@/lib/documentPages";
+import { allowRequest, clientIp, RATE_LIMITED_MESSAGE, UPLOAD_RATE_LIMIT } from "@/lib/rateLimit";
+import { controlsFrom, uploadBlock } from "@/lib/shopControls";
 
 const BUCKET = "print-files";
 
@@ -37,12 +39,27 @@ export async function POST(req: NextRequest) {
 
   const { data: shop } = await supabase
     .from("shops")
-    .select("id, status")
+    .select("id, status, shop_settings(shop_open, accepting_orders, printing_mode)")
     .eq("id", shopId)
     .single();
 
   if (!shop || shop.status !== "active") {
     return NextResponse.json({ error: "Shop not found or inactive." }, { status: 404 });
+  }
+
+  // A closed shop takes no files at all. A paused one still does, so
+  // customers can preview and price their document before it reopens.
+  const closed = uploadBlock(
+    controlsFrom(shop.shop_settings as unknown as Parameters<typeof controlsFrom>[0])
+  );
+  if (closed) {
+    return NextResponse.json({ error: closed.message, code: closed.code }, { status: 403 });
+  }
+
+  // Before the file is counted or stored: a flood of uploads should cost us
+  // a row increment, not CPU and storage.
+  if (!(await allowRequest(supabase, UPLOAD_RATE_LIMIT, shopId, clientIp(req.headers)))) {
+    return NextResponse.json({ error: RATE_LIMITED_MESSAGE, code: "rate_limited" }, { status: 429 });
   }
 
   const bytes = new Uint8Array(await file.arrayBuffer());

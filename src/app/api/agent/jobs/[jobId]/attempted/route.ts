@@ -3,6 +3,22 @@ import { authenticateAgent } from "../../../auth";
 import { createServiceRoleClient } from "@/lib/supabase/server";
 import { printerBelongsToShop } from "@/lib/printerSelection";
 
+/**
+ * The agent saying "I am sending this job to the printer now."
+ *
+ * This is the last gate before paper. It is a compare-and-swap: the job moves
+ * CLAIMED → PRINT_ATTEMPTED only if it is still CLAIMED by this agent at the
+ * instant of the write. The agent prints only after this returns 200, so:
+ *
+ *   - a second report for the same job (a retry, a duplicate request) gets
+ *     409 and the agent prints nothing;
+ *   - a job the owner edited or cancelled, or one requeued as a stale claim,
+ *     is no longer CLAIMED-by-this-agent, so a late report gets 409 too.
+ *
+ * Previously the state was read, checked, and then written unconditionally,
+ * so two reports arriving together could both pass the check.
+ */
+
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ jobId: string }> }
@@ -68,11 +84,25 @@ export async function POST(
     }
   }
 
-  // Update job state
-  await supabase
+  // The gate. Exactly one caller can win this; everyone else gets 409 and
+  // must not print.
+  const { data: moved, error: moveError } = await supabase
     .from("print_jobs")
     .update({ state: "PRINT_ATTEMPTED" })
-    .eq("id", jobId);
+    .eq("id", jobId)
+    .eq("state", "CLAIMED")
+    .eq("claimed_by_agent_id", auth.agentId)
+    .select("id");
+
+  if (moveError) {
+    return NextResponse.json({ error: "Could not record the attempt." }, { status: 500 });
+  }
+  if (!moved || moved.length === 0) {
+    return NextResponse.json(
+      { error: "This job is no longer yours to print. Do not print it." },
+      { status: 409 }
+    );
+  }
 
   // The attempt number is assigned here, not taken from the agent.
   //
@@ -114,7 +144,8 @@ export async function POST(
       print_status: "print_attempted",
       print_started_at: new Date().toISOString(),
     })
-    .eq("id", job.order_id);
+    .eq("id", job.order_id)
+    .eq("shop_id", auth.shopId);
 
   return NextResponse.json({
     status: "ok",

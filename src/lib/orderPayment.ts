@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { formatToken } from "./token";
 import {
+  checkoutUrls,
   loadPayments,
   moneyHeld,
   openCharge,
@@ -353,7 +354,8 @@ export type GatewayPaymentResult =
 export async function applyGatewayPayment(
   db: SupabaseClient,
   gateway: GatewayClient | null,
-  urls: CheckoutUrls,
+  /** Null: use the order's own shop page (checkoutUrls). */
+  urlsOrNull: CheckoutUrls | null,
   cashfreeOrderId: string,
   opts: { gatewayPaymentId?: string } = {}
 ): Promise<GatewayPaymentResult> {
@@ -405,6 +407,12 @@ export async function applyGatewayPayment(
     .eq("shop_id", order.shop_id)
     .maybeSingle();
   const shopGateway: string | null = settings?.payment_gateway ?? null;
+
+  let urls = urlsOrNull;
+  if (!urls) {
+    const { data: shop } = await db.from("shops").select("slug").eq("id", order.shop_id).maybeSingle();
+    urls = checkoutUrls(shop?.slug ?? "");
+  }
 
   let tokenNumber: string | null = order.token_number ?? null;
 

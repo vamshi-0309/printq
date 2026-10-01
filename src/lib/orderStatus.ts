@@ -21,7 +21,14 @@
  * offline reads "Waiting — agent offline" instead of showing a spinner.
  */
 
+import { isPrintResultUncertain } from "./jobState";
+
 export type OrderStateKey =
+  | "pending_approval"
+  | "rejected"
+  | "awaiting_topup"
+  | "uncertain"
+  | "printer_issue"
   | "awaiting_payment"
   | "payment_failed"
   | "waiting_agent"
@@ -61,12 +68,41 @@ export interface OrderStateInput {
   printerAvailable?: boolean;
   completedAt?: string | null;
   failureReason?: string | null;
+  /** orders.print_started_at: when the agent reported sending it. */
+  printStartedAt?: string | null;
+  /** "Out of paper" etc. when the shop's chosen printer reports a problem. */
+  printerProblem?: string | null;
+  now?: Date;
 }
 
 export function deriveOrderState(input: OrderStateInput): DerivedOrderState {
   const payment = (input.paymentStatus ?? "").toLowerCase();
   const print = (input.printStatus ?? "").toLowerCase();
   const job = (input.jobState ?? "").toUpperCase();
+
+  if (print === "rejected" || job === "REJECTED") {
+    return {
+      key: "rejected",
+      label: "Rejected",
+      detail: input.failureReason?.trim()
+        ? `You rejected this: ${input.failureReason.trim()}`
+        : "You rejected this order. The customer was not charged.",
+      tone: "neutral",
+      blocked: false,
+      active: false,
+    };
+  }
+
+  if (print === "pending_approval" || job === "PENDING_APPROVAL") {
+    return {
+      key: "pending_approval",
+      label: "Needs approval",
+      detail: "Check the order, then approve it (the customer is asked to pay) or reject it.",
+      tone: "warning",
+      blocked: true,
+      active: true,
+    };
+  }
 
   if (print === "cancelled" || payment === "expired") {
     return {
@@ -106,6 +142,17 @@ export function deriveOrderState(input: OrderStateInput): DerivedOrderState {
 
   // Paid from here on. "completed" requires the agent's own report — the
   // result endpoint sets completed_at at the same moment.
+  if (print === "awaiting_topup" || job === "AWAITING_TOPUP") {
+    return {
+      key: "awaiting_topup",
+      label: "Waiting for extra payment",
+      detail: "You raised the price. It won't print until the customer pays the difference.",
+      tone: "warning",
+      blocked: false,
+      active: true,
+    };
+  }
+
   if (print === "completed") {
     return {
       key: "completed",
@@ -139,6 +186,20 @@ export function deriveOrderState(input: OrderStateInput): DerivedOrderState {
       detail:
         "Check the printer, then say whether this printed. It will not be sent again on its own.",
       tone: "warning",
+      blocked: true,
+      active: true,
+    };
+  }
+
+  // Sent to the printer, and then silence. Only a person can say what
+  // happened; nothing will resend it on its own.
+  if (isPrintResultUncertain(job || print.toUpperCase(), input.printStartedAt, input.now ?? new Date())) {
+    return {
+      key: "uncertain",
+      label: "Print result uncertain",
+      detail:
+        "The agent sent this to the printer but never confirmed. Check the printer — owner review required before it is sent again.",
+      tone: "danger",
       blocked: true,
       active: true,
     };
@@ -186,6 +247,16 @@ export function deriveOrderState(input: OrderStateInput): DerivedOrderState {
         active: true,
       };
     }
+    if (input.printerProblem) {
+      return {
+        key: "printer_issue",
+        label: "⚠ Printer issue",
+        detail: `${input.printerProblem}. This order is waiting and prints once the printer is fixed.`,
+        tone: "danger",
+        blocked: true,
+        active: true,
+      };
+    }
     if (input.printerAvailable === false) {
       return {
         key: "waiting_agent",
@@ -224,12 +295,15 @@ export function deriveOrderState(input: OrderStateInput): DerivedOrderState {
  */
 export const ORDER_FILTERS: Record<string, { label: string; keys: OrderStateKey[] | null }> = {
   all: { label: "All", keys: null },
-  needs_attention: { label: "Needs attention", keys: ["waiting_agent", "failed", "held"] },
-  awaiting_payment: { label: "Awaiting payment", keys: ["awaiting_payment"] },
+  needs_attention: {
+    label: "Needs attention",
+    keys: ["pending_approval", "waiting_agent", "printer_issue", "uncertain", "failed", "held"],
+  },
+  awaiting_payment: { label: "Awaiting payment", keys: ["awaiting_payment", "awaiting_topup"] },
   in_queue: { label: "In queue", keys: ["queued", "claimed"] },
   printing: { label: "Printing", keys: ["printing"] },
   completed: { label: "Done", keys: ["completed"] },
-  closed: { label: "Failed / cancelled", keys: ["failed", "payment_failed", "cancelled"] },
+  closed: { label: "Failed / cancelled", keys: ["failed", "payment_failed", "cancelled", "rejected"] },
 };
 
 export type OrderFilterKey = keyof typeof ORDER_FILTERS;
