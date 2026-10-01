@@ -28,6 +28,13 @@ export interface PriceLineInput {
   colorMode: ColorMode;
   paperSize: PaperSize;
   sides: Sides;
+  /**
+   * How many of `pageCount` print in colour, when the order mixes colour and
+   * black & white (orders.color_ranges). The rest are black & white, and
+   * `colorMode` is ignored. Omitted for a single-mode order, which prices
+   * exactly as before.
+   */
+  colorPageCount?: number;
 }
 
 export interface PriceBreakdown {
@@ -37,6 +44,13 @@ export interface PriceBreakdown {
   duplexDiscount: number;
   total: number;
   minimumApplied: boolean;
+  /** Present only on a mixed order: the split that was priced. */
+  mixed?: {
+    bwPages: number;
+    colorPages: number;
+    bwRate: number;
+    colorRate: number;
+  };
 }
 
 export class PricingError extends Error {}
@@ -57,21 +71,49 @@ export function calculatePrice(
     throw new PricingError(`${paperSize} is not offered by this shop.`);
   }
 
-  const perPageRate =
-    paperSize === "A4"
-      ? colorMode === "bw"
-        ? config.a4BwPerPage
-        : config.a4ColorPerPage
-      : colorMode === "bw"
-      ? config.a3BwPerPage
-      : config.a3ColorPerPage;
-
-  if (perPageRate == null || perPageRate < 0) {
-    throw new PricingError("This shop hasn't configured a price for that option.");
-  }
+  const rateFor = (mode: ColorMode) => {
+    const rate =
+      paperSize === "A4"
+        ? mode === "bw"
+          ? config.a4BwPerPage
+          : config.a4ColorPerPage
+        : mode === "bw"
+        ? config.a3BwPerPage
+        : config.a3ColorPerPage;
+    if (rate == null || rate < 0 || !Number.isFinite(rate)) {
+      throw new PricingError("This shop hasn't configured a price for that option.");
+    }
+    return rate;
+  };
 
   const totalSheets = pageCount * copies;
-  const subtotalBeforeDuplex = totalSheets * perPageRate;
+
+  let perPageRate: number;
+  let subtotalBeforeDuplex: number;
+  let mixed: PriceBreakdown["mixed"];
+
+  const colorPages = input.colorPageCount;
+  if (colorPages !== undefined && colorPages > 0 && colorPages < pageCount) {
+    if (!Number.isInteger(colorPages)) {
+      throw new PricingError("Colour page count must be a whole number.");
+    }
+    const bwRate = rateFor("bw");
+    const colorRate = rateFor("color");
+    const bwPages = pageCount - colorPages;
+    subtotalBeforeDuplex = (bwPages * bwRate + colorPages * colorRate) * copies;
+    // The blended figure, for displays that show one rate.
+    perPageRate = subtotalBeforeDuplex / totalSheets;
+    mixed = { bwPages, colorPages, bwRate, colorRate };
+  } else {
+    if (colorPages !== undefined && (colorPages < 0 || colorPages > pageCount)) {
+      throw new PricingError("Colour page count is out of range.");
+    }
+    // Every page one mode: an explicit count of 0 or all pages decides it.
+    const mode: ColorMode =
+      colorPages === undefined ? colorMode : colorPages === 0 ? "bw" : "color";
+    perPageRate = rateFor(mode);
+    subtotalBeforeDuplex = totalSheets * perPageRate;
+  }
 
   let duplexDiscount = 0;
   if (sides === "double" && config.duplexDiscountPercent > 0) {
@@ -96,6 +138,7 @@ export function calculatePrice(
     duplexDiscount,
     total,
     minimumApplied,
+    ...(mixed ? { mixed } : {}),
   };
 }
 

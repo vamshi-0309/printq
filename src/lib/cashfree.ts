@@ -70,6 +70,14 @@ export function syntheticCustomerId(orderUuid: string): string {
 
 export type CreateOrderInput = {
   orderUuid: string;
+  /**
+   * The order_id to give Cashfree, when it is not the order UUID itself: a
+   * top-up ("<uuid>-t1") or a re-issued session ("<uuid>-r2"). Cashfree
+   * amounts cannot change after creation, so each new amount is a new
+   * Cashfree order, recorded in its own payments row
+   * (payments.cashfree_order_id). Defaults to the order UUID.
+   */
+  cashfreeOrderId?: string;
   amount: number;
   customerPhone: string;
   returnUrl: string;
@@ -86,12 +94,13 @@ export async function createCashfreeOrder(
   input: CreateOrderInput,
   config: CashfreeConfig
 ): Promise<CreateOrderResult> {
-  if (input.orderUuid.length < 3 || input.orderUuid.length > 45) {
+  const cashfreeOrderId = input.cashfreeOrderId ?? input.orderUuid;
+  if (!/^[A-Za-z0-9_-]{3,45}$/.test(cashfreeOrderId)) {
     throw new CashfreeError("Order id must be between 3 and 45 characters.");
   }
 
   const body = {
-    order_id: input.orderUuid,
+    order_id: cashfreeOrderId,
     order_amount: Number(input.amount),
     order_currency: "INR",
     customer_details: {
@@ -114,7 +123,7 @@ export async function createCashfreeOrder(
         "x-client-id": config.appId,
         "x-client-secret": config.secretKey,
         // Lets Cashfree collapse duplicate creates if we ever retry.
-        "x-idempotency-key": input.orderUuid,
+        "x-idempotency-key": cashfreeOrderId,
       },
       body: JSON.stringify(body),
     });
@@ -148,6 +157,137 @@ export async function createCashfreeOrder(
   return {
     paymentSessionId,
     cfOrderId: cfOrderId == null ? "" : String(cfOrderId),
-    orderId: typeof data.order_id === "string" ? data.order_id : input.orderUuid,
+    orderId: typeof data.order_id === "string" ? data.order_id : cashfreeOrderId,
   };
+}
+
+/* ── Shared request plumbing for the calls below ─────────────────── */
+
+async function cashfreeRequest(
+  method: "GET" | "POST" | "PATCH",
+  path: string,
+  config: CashfreeConfig,
+  body?: unknown,
+  idempotencyKey?: string
+): Promise<{ status: number; data: Record<string, unknown> }> {
+  let res: Response;
+  try {
+    res = await fetch(`${config.baseUrl}${path}`, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-version": config.apiVersion,
+        "x-client-id": config.appId,
+        "x-client-secret": config.secretKey,
+        ...(idempotencyKey ? { "x-idempotency-key": idempotencyKey } : {}),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new CashfreeError("Could not reach the payment gateway.");
+  }
+
+  const text = await res.text();
+  let data: Record<string, unknown> = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      throw new CashfreeError("The payment gateway returned an unreadable response.", res.status);
+    }
+  }
+
+  if (!res.ok) {
+    // Same rule as above: Cashfree's message and code only, never the body.
+    const message = typeof data.message === "string" ? data.message : "The payment gateway refused the request.";
+    const code = typeof data.code === "string" ? data.code : undefined;
+    throw new CashfreeError(message, res.status, code);
+  }
+  return { status: res.status, data };
+}
+
+/* ── Refunds ─────────────────────────────────────────────────────── */
+
+export type RefundInput = {
+  /** The Cashfree order the money was taken on (payments.cashfree_order_id). */
+  cashfreeOrderId: string;
+  /** Ours, unique per refund: Cashfree uses it to collapse retries. */
+  refundId: string;
+  amount: number;
+  note: string;
+};
+
+export type RefundResult = {
+  refundId: string;
+  cfRefundId: string | null;
+  /** Cashfree's status: PENDING, SUCCESS, CANCELLED, ONHOLD... */
+  status: string;
+};
+
+/**
+ * Ask Cashfree to return part or all of a captured payment.
+ *
+ * Never called without the shop owner confirming the amount first — see the
+ * edit and refund actions. A refund is asynchronous at Cashfree's end: the
+ * usual answer is PENDING, and the final outcome arrives by webhook.
+ */
+export async function refundCashfreeOrder(
+  input: RefundInput,
+  config: CashfreeConfig
+): Promise<RefundResult> {
+  if (!(input.amount > 0)) throw new CashfreeError("Refund amount must be positive.");
+  if (!/^[A-Za-z0-9_.-]{3,40}$/.test(input.refundId)) {
+    throw new CashfreeError("Refund id must be 3-40 characters.");
+  }
+
+  const { data } = await cashfreeRequest(
+    "POST",
+    `/orders/${encodeURIComponent(input.cashfreeOrderId)}/refunds`,
+    config,
+    {
+      refund_amount: Number(input.amount.toFixed(2)),
+      refund_id: input.refundId,
+      refund_note: input.note.slice(0, 100),
+    },
+    input.refundId
+  );
+
+  return {
+    refundId: typeof data.refund_id === "string" ? data.refund_id : input.refundId,
+    cfRefundId: data.cf_refund_id == null ? null : String(data.cf_refund_id),
+    status: typeof data.refund_status === "string" ? data.refund_status : "PENDING",
+  };
+}
+
+/**
+ * Stop a Cashfree order from being paid, when its amount is out of date.
+ *
+ * Best effort by design. If this fails — or the customer pays in the instant
+ * before it lands — the webhook still records the money against the payments
+ * row it was taken on, and the order's balance is reconciled from there. So a
+ * failure here is logged, not fatal.
+ */
+export async function terminateCashfreeOrder(
+  cashfreeOrderId: string,
+  config: CashfreeConfig
+): Promise<boolean> {
+  try {
+    await cashfreeRequest(
+      "PATCH",
+      `/orders/${encodeURIComponent(cashfreeOrderId)}`,
+      config,
+      { order_status: "TERMINATED" }
+    );
+    return true;
+  } catch (err) {
+    console.warn(
+      `[cashfree] could not terminate ${cashfreeOrderId}: ${err instanceof Error ? err.message : "unknown"}`
+    );
+    return false;
+  }
+}
+
+/** Cashfree's refund_id for our n-th refund on a payment: compact, ≤ 40 chars. */
+export function refundIdFor(cashfreeOrderId: string, n: number): string {
+  return `${cashfreeOrderId.replace(/[^A-Za-z0-9]/g, "").slice(0, 34)}rf${n}`;
 }

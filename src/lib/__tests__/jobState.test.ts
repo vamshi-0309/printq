@@ -45,9 +45,23 @@ describe("job state machine", () => {
     expect(isSafeToAutoRetry("CLAIMED")).toBe(true);
   });
 
-  it("terminal states have no outgoing transitions except FAILED's explicit shop retry", () => {
-    expect(canTransition("COMPLETED", "QUEUED")).toBe(false);
+  it("terminal states have no outgoing transitions except explicit owner decisions", () => {
     expect(canTransition("CANCELLED", "QUEUED")).toBe(false);
+    expect(canTransition("REJECTED", "QUEUED")).toBe(false);
     expect(canTransition("FAILED", "QUEUED")).toBe(true); // explicit, shop-owner-initiated only
+    // Reprint: owner-initiated, behind a confirmation. No automatic path exists.
+    expect(canTransition("COMPLETED", "QUEUED")).toBe(true);
+    expect(canTransition("COMPLETED", "CLAIMED")).toBe(false);
+  });
+
+  it("an order awaiting a top-up can never be claimed", () => {
+    expect(canTransition("AWAITING_TOPUP", "CLAIMED")).toBe(false);
+    expect(canTransition("AWAITING_TOPUP", "QUEUED")).toBe(true);
+  });
+
+  it("an order awaiting approval can never be claimed or paid directly", () => {
+    expect(canTransition("PENDING_APPROVAL", "CLAIMED")).toBe(false);
+    expect(canTransition("PENDING_APPROVAL", "QUEUED")).toBe(false);
+    expect(canTransition("PENDING_APPROVAL", "PAID")).toBe(false);
   });
 });

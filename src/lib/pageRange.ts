@@ -80,3 +80,106 @@ export function pagesToRangeString(pages: number[]): string {
   }
   return parts.join(",");
 }
+
+/* ── Per-range colour ────────────────────────────────────────────── */
+
+export type PageColorMode = "bw" | "color";
+
+/** One override as stored in orders.color_ranges. */
+export interface ColorRange {
+  range: string;
+  mode: PageColorMode;
+}
+
+/** A run of pages the agent prints in one pass with one colour setting. */
+export interface PrintSegment {
+  pageRange: string;
+  colorMode: PageColorMode;
+}
+
+export type PageColorResult =
+  | {
+      ok: true;
+      colorPages: number[];
+      bwPages: number[];
+      /** In page order. One segment when the whole order is one mode. */
+      segments: PrintSegment[];
+      /**
+       * The overrides restricted to pages actually being printed, or null when
+       * every page uses `defaultMode` — so a mixed order and a plain one are
+       * stored differently only when they print differently.
+       */
+      normalized: ColorRange[] | null;
+    }
+  | { ok: false; error: string };
+
+export const MAX_COLOR_RANGES = 50;
+
+/**
+ * Which selected pages print in colour and which in black & white.
+ *
+ * `defaultMode` covers every selected page; each override then sets its own
+ * pages, later overrides winning. Overrides are validated against the real
+ * page count like any other range. Pages an override names that are not
+ * selected are ignored rather than rejected: unticking a page in the preview
+ * should not make an earlier colour choice an error.
+ *
+ * The same result prices the order and tells the agent how to print it, so
+ * the two cannot disagree.
+ */
+export function resolvePageColors(
+  selectedPages: number[],
+  totalPages: number,
+  defaultMode: PageColorMode,
+  colorRanges: ColorRange[] | null | undefined
+): PageColorResult {
+  const selected = [...new Set(selectedPages)].sort((a, b) => a - b);
+  const modeOf = new Map<number, PageColorMode>(selected.map((p) => [p, defaultMode]));
+
+  const overrides = colorRanges ?? [];
+  if (overrides.length > MAX_COLOR_RANGES) {
+    return { ok: false, error: `Use at most ${MAX_COLOR_RANGES} colour ranges.` };
+  }
+
+  for (const override of overrides) {
+    if (override.mode !== "bw" && override.mode !== "color") {
+      return { ok: false, error: "Each colour range must be black & white or colour." };
+    }
+    const parsed = parsePageRange(String(override.range ?? ""), totalPages);
+    if (!parsed.ok) return { ok: false, error: `Colour range: ${parsed.error}` };
+    for (const p of parsed.pages) {
+      if (modeOf.has(p)) modeOf.set(p, override.mode);
+    }
+  }
+
+  const colorPages = selected.filter((p) => modeOf.get(p) === "color");
+  const bwPages = selected.filter((p) => modeOf.get(p) === "bw");
+
+  // Consecutive selected pages sharing a mode print in one pass.
+  const segments: PrintSegment[] = [];
+  let run: number[] = [];
+  let runMode: PageColorMode | null = null;
+  for (const p of selected) {
+    const mode = modeOf.get(p)!;
+    if (runMode !== null && mode !== runMode) {
+      segments.push({ pageRange: pagesToRangeString(run), colorMode: runMode });
+      run = [];
+    }
+    run.push(p);
+    runMode = mode;
+  }
+  if (runMode !== null) segments.push({ pageRange: pagesToRangeString(run), colorMode: runMode });
+
+  const mixed = colorPages.length > 0 && bwPages.length > 0;
+  const allOtherMode =
+    !mixed && selected.length > 0 && modeOf.get(selected[0]) !== defaultMode;
+
+  let normalized: ColorRange[] | null = null;
+  if (mixed || allOtherMode) {
+    const otherMode: PageColorMode = defaultMode === "bw" ? "color" : "bw";
+    const otherPages = otherMode === "color" ? colorPages : bwPages;
+    normalized = [{ range: pagesToRangeString(otherPages), mode: otherMode }];
+  }
+
+  return { ok: true, colorPages, bwPages, segments, normalized };
+}

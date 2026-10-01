@@ -62,6 +62,8 @@ export type CashfreeWebhookEvent = {
   cfPaymentId: string | null;
   paymentStatus: string | null;
   amount: number | null;
+  /** Present on REFUND_STATUS_WEBHOOK events only. */
+  refund?: { refundId: string | null; status: string | null; amount: number | null };
 };
 
 /**
@@ -85,6 +87,24 @@ export function parseCashfreeEvent(payload: unknown): CashfreeWebhookEvent | nul
   const data = (root.data ?? {}) as Record<string, unknown>;
   const order = (data.order ?? {}) as Record<string, unknown>;
   const payment = (data.payment ?? {}) as Record<string, unknown>;
+
+  // Refund webhooks carry { data: { refund: { order_id, refund_id, ... } } }
+  // and no `order` object.
+  if (data.refund && typeof data.refund === "object") {
+    const refund = data.refund as Record<string, unknown>;
+    return {
+      type,
+      orderId: typeof refund.order_id === "string" ? refund.order_id : null,
+      cfPaymentId: null,
+      paymentStatus: null,
+      amount: null,
+      refund: {
+        refundId: typeof refund.refund_id === "string" ? refund.refund_id : null,
+        status: typeof refund.refund_status === "string" ? refund.refund_status : null,
+        amount: typeof refund.refund_amount === "number" ? refund.refund_amount : null,
+      },
+    };
+  }
 
   return {
     type,
@@ -110,4 +130,9 @@ export function isFailureEvent(e: CashfreeWebhookEvent): boolean {
     e.paymentStatus === "FAILED" ||
     e.paymentStatus === "USER_DROPPED"
   );
+}
+
+/** A refund we started has reached a final or intermediate state. */
+export function isRefundEvent(e: CashfreeWebhookEvent): boolean {
+  return Boolean(e.refund) && e.type.startsWith("REFUND");
 }
