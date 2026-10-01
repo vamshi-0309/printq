@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { OrderActions } from "@/components/dashboard/OrderActions";
 import { useDashboardResource } from "@/hooks/useDashboardResource";
 import type { OverviewResponse, QueueItem } from "@/lib/dashboardTypes";
 import {
@@ -41,6 +42,13 @@ export default function DashboardPage() {
       realtimeShopIdFrom: (d) => d.shop.id,
     });
 
+  // A one-second tick for the live order ages.
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
   if (loading) {
     return <OverviewSkeleton />;
   }
@@ -54,8 +62,9 @@ export default function DashboardPage() {
     );
   }
 
-  const { readiness, today, queue, counts, shop, settings } = data;
-  const now = Date.parse(data.serverTime);
+  const { readiness, today, queue, counts, shop, settings, controls, printerIssue } = data;
+  // The server's clock, advanced locally so order ages tick between refreshes.
+  const now = Date.parse(data.serverTime) + Math.max(0, clock - (updatedAt ?? clock));
 
   return (
     <div className="space-y-7">
@@ -66,6 +75,41 @@ export default function DashboardPage() {
         refreshing={refreshing}
         onRefresh={refresh}
       />
+
+      <ShopSwitches controls={controls} onChanged={refresh} />
+
+      {!readiness.agentOnline && readiness.agents.length > 0 && (
+        <section
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-3 border-2 border-magenta bg-magenta/[0.06] px-4 py-3"
+        >
+          <div>
+            <p className="text-[15px] font-semibold text-magenta">Agent offline</p>
+            <p className="text-[12.5px] text-ink-soft">
+              Orders keep coming in and wait safely in the queue. They print, in order, as soon as the
+              PrintQ agent on your counter PC reconnects.
+            </p>
+          </div>
+          <Link href="/dashboard/agent" className="shrink-0 border border-ink bg-ink px-3 py-1.5 text-[12.5px] font-medium text-paper">
+            Check the agent
+          </Link>
+        </section>
+      )}
+
+      {printerIssue && (
+        <section role="alert" className="border-2 border-toner-yellow bg-toner-yellow/[0.08] px-4 py-3">
+          <p className="text-[15px] font-semibold text-ink">
+            ⚠ Printer issue
+            {printerIssue.waitingOrder ? ` — Order ${printerIssue.waitingOrder} is waiting` : ""}
+          </p>
+          <p className="mt-0.5 text-[12.5px] text-ink-soft">
+            {printerIssue.printer}: {printerIssue.problem}.{" "}
+            {printerIssue.waitingCount > 0
+              ? `${printerIssue.waitingCount} order${printerIssue.waitingCount === 1 ? " is" : "s are"} held in the queue and will print once it's fixed. Nothing is sent to another printer.`
+              : "Nothing will print until it's fixed."}
+          </p>
+        </section>
+      )}
 
       {/* Three signals, kept apart on purpose. */}
       <div className="flex flex-wrap items-center gap-2">
@@ -199,7 +243,13 @@ export default function DashboardPage() {
         ) : (
           <ul className="divide-y divide-line border border-line bg-paper">
             {queue.map((order) => (
-              <QueueRow key={order.id} order={order} now={now} onChanged={refresh} />
+              <QueueRow
+                key={order.id}
+                order={order}
+                now={now}
+                gateway={settings.paymentGateway}
+                onChanged={refresh}
+              />
             ))}
           </ul>
         )}
@@ -215,40 +265,24 @@ export default function DashboardPage() {
 function QueueRow({
   order,
   now,
+  gateway,
   onChanged,
 }: {
   order: QueueItem;
   now: number;
+  gateway: string | null;
   onChanged: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const confirmPayment = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await fetch(`/api/shop/orders/${order.id}/action`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "confirm_payment" }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setError(body.error ?? "Could not confirm this payment.");
-        return;
-      }
-      onChanged();
-    } catch {
-      setError("Couldn't reach the server.");
-    } finally {
-      setBusy(false);
-    }
-  };
+  const colour =
+    order.colorRanges && order.colorRanges.length > 0
+      ? `Mixed (${order.colorMode === "bw" ? "colour" : "B&W"} ${order.colorRanges.map((r) => r.range).join(",")})`
+      : order.colorMode === "bw"
+        ? "B&W"
+        : "Colour";
 
   return (
     <li className="px-4 py-3">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+      <div className="flex flex-wrap items-start gap-x-4 gap-y-2">
         <span className="w-14 shrink-0 font-data text-[19px] font-semibold leading-none tracking-[-0.02em] text-ink">
           {order.tokenNumber ?? <span className="text-ink-soft/50">—</span>}
         </span>
@@ -262,49 +296,228 @@ function QueueRow({
               {order.publicOrderId}
             </Link>
             <StatusPill tone={order.state.tone}>{order.state.label}</StatusPill>
+            <PaymentPill status={order.paymentStatus} jobState={order.jobState} />
           </div>
           <p className="mt-1 text-[12.5px] leading-snug text-ink-soft">{order.state.detail}</p>
+          <dl className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 font-data text-[10.5px] uppercase tracking-[0.06em] text-ink-soft">
+            <Spec label="pages">
+              {order.pageCount ?? "?"}
+              {order.pageRange && order.pageRange !== "all" ? ` (${order.pageRange})` : ""}
+            </Spec>
+            <Spec label="copies">{order.copies}</Spec>
+            <Spec label="colour">{colour}</Spec>
+            <Spec label="paper">{order.paperSize}</Spec>
+            <Spec label="orient.">{order.orientation}</Spec>
+            <Spec label="sides">{order.sides === "double" ? "duplex" : "single"}</Spec>
+            <Spec label="scale">{order.fitMode === "actual" ? "actual" : "fit"}</Spec>
+            <Spec label="printer">{order.printerName ?? "none chosen"}</Spec>
+          </dl>
         </div>
 
         <div className="shrink-0 text-right">
           <p className="font-data text-[13px] text-ink">{formatRupees(order.amount)}</p>
-          <p className="font-data text-[10.5px] uppercase tracking-[0.08em] text-ink-soft">
-            {order.pageCount ?? "?"}p × {order.copies} · {order.colorMode === "bw" ? "B&W" : "Colour"}{" "}
-            · {order.paperSize}
+          <p className="font-data text-[10.5px] uppercase tracking-[0.08em] text-ink-soft" title={absoluteTime(order.createdAt)}>
+            age {orderAge(order.createdAt, now)}
           </p>
         </div>
-
-        {order.state.key === "awaiting_payment" ? (
-          <button
-            type="button"
-            onClick={confirmPayment}
-            disabled={busy}
-            className="shrink-0 border border-cyan bg-cyan px-3 py-1.5 text-[12.5px] font-medium text-paper transition-colors hover:bg-cyan-deep disabled:opacity-50"
-          >
-            {busy ? "Confirming…" : "Mark as paid"}
-          </button>
-        ) : (
-          <Link
-            href={`/dashboard/orders/${order.id}`}
-            className="shrink-0 border border-line px-3 py-1.5 text-[12.5px] font-medium text-ink-soft transition-colors hover:border-ink hover:text-ink"
-          >
-            Open
-          </Link>
-        )}
       </div>
 
-      <p className="mt-1.5 font-data text-[10.5px] uppercase tracking-[0.08em] text-ink-soft">
-        {order.paidAt ? `paid ${relativeTime(order.paidAt, now)}` : `uploaded ${relativeTime(order.createdAt, now)}`}
-        {" · "}
-        {absoluteTime(order.createdAt)}
-      </p>
+      <div className="mt-2.5 sm:pl-[4.5rem]">
+        <OrderActions
+          compact
+          order={{
+            id: order.id,
+            label: order.tokenNumber ?? order.publicOrderId,
+            amount: order.amount,
+            moneyHeld: order.moneyHeld,
+            refundable: order.refundable,
+            jobState: order.jobState,
+            gateway,
+            copies: order.copies,
+            colorMode: order.colorMode,
+            paperSize: order.paperSize,
+            sides: order.sides,
+            orientation: order.orientation,
+            fitMode: order.fitMode,
+            pageRange: order.pageRange,
+            colorRanges: order.colorRanges,
+          }}
+          actions={order.actions}
+          onDone={onChanged}
+        />
+      </div>
+    </li>
+  );
+}
 
+function Spec({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex gap-1">
+      <dt className="text-ink-soft/70">{label}</dt>
+      <dd className="text-ink">{children}</dd>
+    </div>
+  );
+}
+
+function PaymentPill({ status, jobState }: { status: string; jobState: string | null }) {
+  if (jobState === "AWAITING_TOPUP") return <StatusPill tone="warning">Owes more</StatusPill>;
+  if (status === "paid") return <StatusPill tone="success">Paid</StatusPill>;
+  if (jobState === "PENDING_APPROVAL") return <StatusPill tone="neutral">Not charged</StatusPill>;
+  if (status === "failed") return <StatusPill tone="danger">Payment failed</StatusPill>;
+  return <StatusPill tone="warning">Unpaid</StatusPill>;
+}
+
+/** "4m 12s", "1h 03m" — how long the customer has been waiting. */
+function orderAge(createdAt: string, now: number): string {
+  const seconds = Math.max(0, Math.floor((now - Date.parse(createdAt)) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/**
+ * The owner's two switches, at the top of the screen, plus how orders print.
+ * Each flip is saved at once and takes effect on the customer page and in the
+ * order route on the next request.
+ */
+function ShopSwitches({
+  controls,
+  onChanged,
+}: {
+  controls: OverviewResponse["controls"];
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async (key: string, patch: Record<string, unknown>) => {
+    setBusy(key);
+    setError(null);
+    try {
+      const res = await fetch("/api/shop/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ controls: patch }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(body.error ?? "Couldn't save that.");
+        return;
+      }
+      onChanged();
+    } catch {
+      setError("Couldn't reach the server.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="flex flex-wrap items-stretch gap-2">
+      <Switch
+        label="Shop"
+        on={controls.shopOpen}
+        onText="Open"
+        offText="Closed"
+        hint={controls.shopOpen ? "Customers can upload" : "Customers see “closed”"}
+        busy={busy === "open"}
+        onToggle={() => save("open", { shopOpen: !controls.shopOpen })}
+      />
+      <Switch
+        label="New orders"
+        on={controls.acceptingOrders}
+        onText="Accepting"
+        offText="Paused"
+        hint={controls.acceptingOrders ? "Customers can order" : "Browse & preview only"}
+        busy={busy === "accepting"}
+        disabled={!controls.shopOpen}
+        onToggle={() => save("accepting", { acceptingOrders: !controls.acceptingOrders })}
+      />
+      <div className="flex min-w-[12rem] flex-1 flex-col justify-center border border-line bg-paper px-3 py-2">
+        <p className="font-data text-[10px] uppercase tracking-[0.12em] text-ink-soft">Printing</p>
+        <div className="mt-1 flex gap-1" role="radiogroup" aria-label="Printing mode">
+          {(
+            [
+              ["automatic", "Automatic"],
+              ["approval_required", "Approve first"],
+            ] as const
+          ).map(([mode, text]) => (
+            <button
+              key={mode}
+              type="button"
+              role="radio"
+              aria-checked={controls.printingMode === mode}
+              disabled={busy !== null}
+              onClick={() => controls.printingMode !== mode && save("mode", { printingMode: mode })}
+              className={`border px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                controls.printingMode === mode
+                  ? "border-ink bg-ink text-paper"
+                  : "border-line text-ink-soft hover:border-ink hover:text-ink"
+              }`}
+            >
+              {text}
+            </button>
+          ))}
+        </div>
+      </div>
       {error && (
-        <p role="alert" className="mt-2 text-[12.5px] text-magenta">
+        <p role="alert" className="w-full text-[12.5px] text-magenta">
           {error}
         </p>
       )}
-    </li>
+    </section>
+  );
+}
+
+function Switch({
+  label,
+  on,
+  onText,
+  offText,
+  hint,
+  busy,
+  disabled,
+  onToggle,
+}: {
+  label: string;
+  on: boolean;
+  onText: string;
+  offText: string;
+  hint: string;
+  busy: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={`${label}: ${on ? onText : offText}`}
+      onClick={onToggle}
+      disabled={busy || disabled}
+      className={`flex min-w-[10rem] flex-1 items-center justify-between gap-3 border px-3 py-2 text-left transition-colors disabled:opacity-50 ${
+        on ? "border-emerald-500/40 bg-emerald-50/60" : "border-magenta/40 bg-magenta/[0.05]"
+      }`}
+    >
+      <span>
+        <span className="block font-data text-[10px] uppercase tracking-[0.12em] text-ink-soft">{label}</span>
+        <span className={`block text-[14px] font-semibold ${on ? "text-emerald-800" : "text-magenta"}`}>
+          {busy ? "Saving…" : on ? onText : offText}
+        </span>
+        <span className="block text-[11px] text-ink-soft">{hint}</span>
+      </span>
+      <span
+        aria-hidden="true"
+        className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${on ? "bg-emerald-500" : "bg-ink-soft/40"}`}
+      >
+        <span
+          className={`absolute top-0.5 h-4 w-4 rounded-full bg-paper transition-all ${on ? "left-[1.125rem]" : "left-0.5"}`}
+        />
+      </span>
+    </button>
   );
 }
 

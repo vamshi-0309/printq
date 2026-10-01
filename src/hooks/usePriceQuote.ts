@@ -26,6 +26,8 @@ export type PriceBreakdown = {
   duplexDiscount: number;
   total: number;
   minimumApplied: boolean;
+  /** Present on a mixed colour / B&W order: the split that was priced. */
+  mixed?: { bwPages: number; colorPages: number; bwRate: number; colorRate: number };
 };
 
 export type QuoteInput = {
@@ -36,6 +38,7 @@ export type QuoteInput = {
   paperSize: string;
   sides: string;
   pageRange: string;
+  colorRanges?: { range: string; mode: "bw" | "color" }[] | null;
 };
 
 type Settled = {

@@ -178,12 +178,22 @@ function PrinterCard({
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(printer.display_name);
 
-  const tone = printer.available ? "success" : printer.is_enabled ? "warning" : "neutral";
-  const statusLabel = printer.available
-    ? (printer.last_status ?? "ready")
-    : printer.is_enabled
-      ? "agent offline"
-      : "disabled";
+  // A problem the printer itself reports outranks everything else: it is the
+  // reason jobs are waiting.
+  const tone = printer.problem
+    ? "danger"
+    : printer.available
+      ? "success"
+      : printer.is_enabled
+        ? "warning"
+        : "neutral";
+  const statusLabel = printer.problem
+    ? `⚠ ${printer.problem}`
+    : printer.available
+      ? "ready"
+      : printer.is_enabled
+        ? "agent offline"
+        : "disabled";
 
   return (
     <li className="border border-line bg-paper">
@@ -241,6 +251,12 @@ function PrinterCard({
               when the owner has given the printer a friendlier label. */}
           <p className="mt-0.5 break-all font-data text-[11px] text-ink-soft">
             {printer.system_name}
+          </p>
+          <p className="mt-0.5 font-data text-[10.5px] uppercase tracking-[0.08em] text-ink-soft">
+            on {printer.agentHostname ?? "an unknown PC"} ·{" "}
+            <span className={printer.agentOnline ? "text-emerald-700" : "text-magenta"}>
+              {printer.agentOnline ? "online" : "offline"}
+            </span>
           </p>
         </div>
 

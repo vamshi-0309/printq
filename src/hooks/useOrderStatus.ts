@@ -16,6 +16,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * isn't making requests every few seconds.
  */
 
+/** Mirrors buildCustomerStatus in src/lib/customerStatus.ts. */
 export type OrderStatus = {
   orderId: string;
   shopName: string | null;
@@ -23,12 +24,27 @@ export type OrderStatus = {
   paymentStatus: string;
   printStatus: string;
   amount: number;
+  amountPaid: number;
   copies: number;
   colorMode: string;
+  colorRanges: { range: string; mode: "bw" | "color" }[] | null;
   paperSize: string;
   sides: string;
+  orientation: string;
+  fitMode: string;
   pageCount: number | null;
+  pageRange: string | null;
   queuePosition: number | null;
+  currentlyPrinting: string | null;
+  estimatedWaitMinutes: number | null;
+  payment: {
+    kind: "order" | "topup";
+    amount: number;
+    gateway: "cashfree" | null;
+    paymentSessionId: string | null;
+  } | null;
+  upiLink: string | null;
+  rejectionReason: string | null;
   createdAt: string;
   paidAt: string | null;
   completedAt: string | null;
@@ -36,7 +52,7 @@ export type OrderStatus = {
 };
 
 /** States that will never change again — stop polling once we reach one. */
-const TERMINAL = new Set(["completed", "cancelled"]);
+const TERMINAL = new Set(["completed", "cancelled", "rejected"]);
 
 const ACTIVE_INTERVAL_MS = 3000;
 const IDLE_INTERVAL_MS = 10000;
@@ -47,6 +63,9 @@ export function useOrderStatus(
 ) {
   const [status, setStatus] = useState<OrderStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The link has outlived the order (finished over a day ago, or its file
+  // was deleted before it was paid). Polling stops; the page says so.
+  const [expired, setExpired] = useState(false);
   const timerRef = useRef<number | null>(null);
   const stoppedRef = useRef(false);
 
@@ -59,6 +78,11 @@ export function useOrderStatus(
         body: JSON.stringify({ orderId: orderUuid, customerSessionToken }),
       });
       const data = await res.json().catch(() => ({}));
+      if (res.status === 410 && data.expired) {
+        stoppedRef.current = true;
+        setExpired(true);
+        return null;
+      }
       if (!res.ok) {
         setError(data.error ?? "Could not load your order.");
         return null;
@@ -93,7 +117,10 @@ export function useOrderStatus(
         stoppedRef.current = true;
         return;
       }
-      const waiting = latest?.paymentStatus === "paid";
+      // Poll briskly while something is about to change: in the queue, or
+      // waiting on the shop's approval.
+      const waiting =
+        latest?.paymentStatus === "paid" || latest?.printStatus === "pending_approval";
       timerRef.current = window.setTimeout(
         tick,
         waiting ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS
@@ -115,5 +142,5 @@ export function useOrderStatus(
     };
   }, [orderUuid, customerSessionToken, fetchOnce]);
 
-  return { status, error, refresh: fetchOnce };
+  return { status, error, expired, refresh: fetchOnce };
 }

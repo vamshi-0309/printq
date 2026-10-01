@@ -5,6 +5,8 @@ import { PrintQMark } from "@/components/SiteHeader";
 import { createServiceRoleClient } from "@/lib/supabase/server";
 import type { PaperSize } from "@/components/customer/PrintOptions";
 import { anyAgentOnline } from "@/lib/agentStatus";
+import { controlsFrom } from "@/lib/shopControls";
+import { selectPrinterForShop, type ShopPrinterRow } from "@/lib/printerSelection";
 
 /**
  * The page a customer lands on after scanning the shop's QR code.
@@ -24,8 +26,14 @@ type ShopWithRelations = {
   city: string | null;
   status: string;
   pricing: { enabled_paper_sizes: string[] } | null;
-  shop_settings: { heartbeat_timeout_seconds: number } | null;
+  shop_settings: {
+    heartbeat_timeout_seconds: number;
+    shop_open: boolean | null;
+    accepting_orders: boolean | null;
+    printing_mode: string | null;
+  } | null;
   print_agents: { last_heartbeat_at: string | null }[] | null;
+  printers: ShopPrinterRow[] | null;
 };
 
 export default async function ShopPrintPage({
@@ -45,7 +53,7 @@ export default async function ShopPrintPage({
   const { data } = await supabase
     .from("shops")
     .select(
-      "id, shop_name, city, status, pricing(enabled_paper_sizes), shop_settings(heartbeat_timeout_seconds), print_agents(last_heartbeat_at)"
+      "id, shop_name, city, status, pricing(enabled_paper_sizes), shop_settings(heartbeat_timeout_seconds, shop_open, accepting_orders, printing_mode), print_agents(last_heartbeat_at), printers(id, shop_id, system_name, display_name, is_default, is_enabled, supports_color, supports_duplex)"
     )
     .eq("slug", shopId)
     .single();
@@ -67,6 +75,16 @@ export default async function ShopPrintPage({
     agents,
     shopSettings?.heartbeat_timeout_seconds ?? undefined
   );
+
+  // The owner's own switches. Only these three booleans/modes are passed to
+  // the browser, not the settings row.
+  const controls = controlsFrom(shopSettings);
+
+  // Double-sided is offered only when the printer the shop prints to can do
+  // it. No printer reported yet: nothing to check, so it is offered (the
+  // order route applies the same rule).
+  const chosen = selectPrinterForShop(shop.printers ?? [], shop.id);
+  const duplexAvailable = chosen.ok ? chosen.printer.supportsDuplex : true;
 
   // Only offer sizes the shop actually stocks; fall back to A4 so the form is
   // never empty if pricing hasn't been configured yet.
@@ -91,16 +109,16 @@ export default async function ShopPrintPage({
           </div>
           <span
             className={`flex shrink-0 items-center gap-1.5 border px-2 py-1 font-data text-[10px] uppercase tracking-[0.1em] ${
-              shopOnline
+              shopOnline && controls.shopOpen
                 ? "border-emerald-500/30 bg-emerald-50 text-emerald-700"
                 : "border-line bg-paper-grey text-ink-soft"
             }`}
           >
             <span
-              className={`h-1.5 w-1.5 rounded-full ${shopOnline ? "bg-emerald-500" : "bg-ink-soft/40"}`}
+              className={`h-1.5 w-1.5 rounded-full ${shopOnline && controls.shopOpen ? "bg-emerald-500" : "bg-ink-soft/40"}`}
               aria-hidden="true"
             />
-            {shopOnline ? "Open" : "Offline"}
+            {!controls.shopOpen ? "Closed" : shopOnline ? "Open" : "Offline"}
           </span>
         </div>
       </header>
@@ -111,6 +129,8 @@ export default async function ShopPrintPage({
           shopName={shop.shop_name}
           shopOnline={shopOnline}
           enabledPaperSizes={paperSizes}
+          controls={controls}
+          duplexAvailable={duplexAvailable}
         />
       </div>
     </main>

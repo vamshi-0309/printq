@@ -15,11 +15,21 @@ export type ColorMode = "bw" | "color";
 export type PaperSize = "A4" | "A3";
 export type Sides = "single" | "double";
 
+export type Orientation = "auto" | "portrait" | "landscape";
+export type FitMode = "fit" | "actual";
+
 export type Options = {
   copies: number;
   colorMode: ColorMode;
   paperSize: PaperSize;
   sides: Sides;
+  orientation: Orientation;
+  fitMode: FitMode;
+  /**
+   * Pages printed in the OTHER mode, e.g. "3-4" in colour on a black & white
+   * order. Empty means every page uses colorMode.
+   */
+  otherModePages: string;
 };
 
 export function PrintOptions({
@@ -27,11 +37,17 @@ export function PrintOptions({
   onChange,
   enabledPaperSizes,
   disabled,
+  duplexAvailable = true,
+  multiPage = true,
 }: {
   value: Options;
   onChange: (next: Options) => void;
   enabledPaperSizes: PaperSize[];
   disabled?: boolean;
+  /** Only offer double-sided when the shop's printer can do it. */
+  duplexAvailable?: boolean;
+  /** Per-page colour only makes sense for a document with pages. */
+  multiPage?: boolean;
 }) {
   const set = <K extends keyof Options>(key: K, v: Options[K]) =>
     onChange({ ...value, [key]: v });
@@ -59,14 +75,54 @@ export function PrintOptions({
         />
       </Field>
 
-      <Field label="Sides">
+      {multiPage && (
+        <Field label={value.colorMode === "bw" ? "Some pages in colour?" : "Some pages in black & white?"}>
+          <input
+            value={value.otherModePages}
+            onChange={(e) => set("otherModePages", e.target.value.replace(/[^0-9,\-\s]/g, ""))}
+            inputMode="numeric"
+            placeholder="Leave empty, or pages like 3-4,7"
+            aria-label={value.colorMode === "bw" ? "Pages to print in colour" : "Pages to print in black and white"}
+            className="w-full border border-line bg-paper px-3 py-3 font-data text-[14px] text-ink placeholder:font-sans placeholder:text-[13px] placeholder:text-ink-soft/60 focus:outline-none focus:ring-2 focus:ring-cyan/40"
+          />
+        </Field>
+      )}
+
+      {duplexAvailable && (
+        <Field label="Sides">
+          <Segmented
+            name="sides"
+            value={value.sides}
+            onChange={(v) => set("sides", v as Sides)}
+            options={[
+              { value: "single", label: "Single" },
+              { value: "double", label: "Double" },
+            ]}
+          />
+        </Field>
+      )}
+
+      <Field label="Orientation">
         <Segmented
-          name="sides"
-          value={value.sides}
-          onChange={(v) => set("sides", v as Sides)}
+          name="orientation"
+          value={value.orientation}
+          onChange={(v) => set("orientation", v as Orientation)}
           options={[
-            { value: "single", label: "Single" },
-            { value: "double", label: "Double" },
+            { value: "auto", label: "Auto" },
+            { value: "portrait", label: "Portrait" },
+            { value: "landscape", label: "Landscape" },
+          ]}
+        />
+      </Field>
+
+      <Field label="Size on paper">
+        <Segmented
+          name="fit"
+          value={value.fitMode}
+          onChange={(v) => set("fitMode", v as FitMode)}
+          options={[
+            { value: "fit", label: "Fit to page" },
+            { value: "actual", label: "Actual size" },
           ]}
         />
       </Field>

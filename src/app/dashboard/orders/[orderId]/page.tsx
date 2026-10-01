@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { use, useState } from "react";
 import { useDashboardResource } from "@/hooks/useDashboardResource";
-import type { OrderDetailResponse, OrderAction } from "@/lib/dashboardTypes";
+import type { OrderDetailResponse } from "@/lib/dashboardTypes";
+import { OrderActions } from "@/components/dashboard/OrderActions";
 import {
   PageHeader,
   StatusPill,
@@ -56,7 +57,7 @@ export default function OrderDetailPage({
     );
   }
 
-  const { order, file, payment, job, attempts, actions, queuePosition } = data;
+  const { order, file, payment, job, attempts, actions, queuePosition, payments, printer } = data;
   const now = Date.parse(data.serverTime);
 
   return (
@@ -75,9 +76,35 @@ export default function OrderDetailPage({
 
       <p className="text-[13.5px] leading-relaxed text-ink-soft">{order.state.detail}</p>
 
-      {actions.length > 0 && (
-        <ActionBar orderId={order.id} actions={actions} onDone={refresh} />
-      )}
+      <section className="border border-line bg-paper px-4 py-3.5">
+        <p className="mb-3 font-data text-[10.5px] font-semibold uppercase tracking-[0.12em] text-ink-soft">
+          What do you want to do
+        </p>
+        <OrderActions
+          order={{
+            id: order.id,
+            label: order.tokenNumber ?? order.publicOrderId,
+            amount: order.amount,
+            moneyHeld: data.moneyHeld,
+            refundable: data.refundable,
+            jobState: job?.state ?? null,
+            gateway: data.shopGateway,
+            copies: order.copies,
+            colorMode: order.colorMode,
+            paperSize: order.paperSize,
+            sides: order.sides,
+            orientation: order.orientation,
+            fitMode: order.fitMode,
+            pageRange: order.pageRange,
+            colorRanges: order.colorRanges,
+          }}
+          actions={actions}
+          onDone={refresh}
+        />
+        {actions.length === 0 && job?.state !== "PRINT_ATTEMPTED" && job?.state !== "PRINTING" && (
+          <p className="text-[12.5px] text-ink-soft">Nothing to do on this order.</p>
+        )}
+      </section>
 
       <div className="grid gap-5 lg:grid-cols-[1.15fr_1fr]">
         <div className="space-y-5">
@@ -93,10 +120,27 @@ export default function OrderDetailPage({
                 {order.pageRange && order.pageRange !== "all" ? ` (range ${order.pageRange})` : ""}
               </Row>
               <Row label="Copies">{order.copies}</Row>
-              <Row label="Colour">{order.colorMode === "bw" ? "Black & white" : "Colour"}</Row>
+              <Row label="Colour">
+                {order.colorMode === "bw" ? "Black & white" : "Colour"}
+                {order.colorRanges && order.colorRanges.length > 0 &&
+                  ` · ${order.colorRanges.map((r) => `${r.range} in ${r.mode === "bw" ? "B&W" : "colour"}`).join(", ")}`}
+              </Row>
               <Row label="Paper">{order.paperSize}</Row>
               <Row label="Sides">{order.sides === "double" ? "Double-sided" : "Single-sided"}</Row>
               <Row label="Orientation">{order.orientation}</Row>
+              <Row label="Scaling">{order.fitMode === "actual" ? "Actual size" : "Fit to page"}</Row>
+              <Row label="Printer">
+                {printer ? (
+                  <>
+                    {printer.displayName}
+                    {printer.displayName !== printer.systemName && (
+                      <span className="block font-data text-[10.5px] text-ink-soft">{printer.systemName}</span>
+                    )}
+                  </>
+                ) : (
+                  "none chosen"
+                )}
+              </Row>
             </dl>
           </section>
 
@@ -132,6 +176,12 @@ export default function OrderDetailPage({
                 </>
               )}
               <Row label="Status">{order.paymentStatus}</Row>
+              <Row label="Customer has paid">{formatRupees(data.moneyHeld)}</Row>
+              {data.refundable > 0 && (
+                <Row label="Refund due">
+                  <span className="font-semibold text-magenta">{formatRupees(data.refundable)}</span>
+                </Row>
+              )}
               {payment && (
                 <>
                   <Row label="Method">
@@ -149,6 +199,31 @@ export default function OrderDetailPage({
               )}
             </dl>
           </section>
+
+          {payments.length > 1 && (
+            <section className="border border-line bg-paper">
+              <div className="border-b border-line px-4 py-2.5">
+                <p className="font-data text-[10.5px] font-semibold uppercase tracking-[0.12em] text-ink-soft">
+                  Every charge on this order
+                </p>
+              </div>
+              <ul className="divide-y divide-line text-[12.5px]">
+                {payments.map((p) => (
+                  <li key={p.id} className="flex flex-wrap items-baseline justify-between gap-2 px-4 py-2">
+                    <span className="text-ink">
+                      {p.purpose === "topup" ? "Extra payment" : "Payment"} {formatRupees(p.amount)}
+                      <span className="ml-1.5 font-data text-[10.5px] uppercase text-ink-soft">{p.status}</span>
+                    </span>
+                    <span className="font-data text-[10.5px] text-ink-soft">
+                      {p.refundAmount
+                        ? `refund ${formatRupees(p.refundAmount)} ${p.refundStatus ?? ""}`
+                        : absoluteTime(p.verifiedAt ?? p.createdAt)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
 
           <section className="space-y-3">
             <SectionHeading eyebrow="Evidence" title="What actually happened" />
@@ -206,7 +281,9 @@ function Timeline({ data, now }: { data: OrderDetailResponse; now: number }) {
     events.push({
       at: attempt.attempted_at,
       label: `Attempt ${attempt.attempt_number}: ${attempt.result ?? "sent to printer"}`,
-      detail: attempt.error_message ?? undefined,
+      detail: attempt.error_label
+        ? `${attempt.error_label}${attempt.error_message ? ` — ${attempt.error_message}` : ""}`
+        : (attempt.error_message ?? undefined),
     });
   }
 
@@ -320,98 +397,6 @@ function FileCard({
           </p>
         )}
       </div>
-    </section>
-  );
-}
-
-function ActionBar({
-  orderId,
-  actions,
-  onDone,
-}: {
-  orderId: string;
-  actions: OrderAction[];
-  onDone: () => void;
-}) {
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [confirming, setConfirming] = useState<OrderAction | null>(null);
-
-  const run = async (action: OrderAction) => {
-    setBusy(action.action);
-    setError(null);
-    setConfirming(null);
-    try {
-      const res = await fetch(`/api/shop/orders/${orderId}/action`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: action.action }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setError(body.error ?? "That didn't work.");
-        return;
-      }
-      onDone();
-    } catch {
-      setError("Couldn't reach the server.");
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  return (
-    <section className="border border-line bg-paper px-4 py-3.5">
-      <p className="font-data text-[10.5px] font-semibold uppercase tracking-[0.12em] text-ink-soft">
-        What do you want to do
-      </p>
-
-      <div className="mt-3 flex flex-wrap gap-2">
-        {actions.map((action) => (
-          <button
-            key={action.action}
-            type="button"
-            title={action.description}
-            onClick={() => (action.destructive ? setConfirming(action) : run(action))}
-            disabled={busy !== null}
-            className={`border px-3.5 py-2 text-[13px] font-medium transition-colors disabled:opacity-50 ${
-              action.destructive
-                ? "border-magenta/40 bg-paper text-magenta hover:bg-magenta/[0.06]"
-                : "border-ink bg-paper text-ink hover:bg-paper-grey"
-            }`}
-          >
-            {busy === action.action ? "Working…" : action.label}
-          </button>
-        ))}
-      </div>
-
-      {confirming && (
-        <div className="mt-3 border border-magenta/30 bg-magenta/[0.04] px-3.5 py-3">
-          <p className="text-[13px] text-ink">{confirming.description}</p>
-          <div className="mt-2.5 flex gap-2">
-            <button
-              type="button"
-              onClick={() => run(confirming)}
-              className="border border-magenta bg-magenta px-3 py-1.5 text-[12.5px] font-medium text-paper"
-            >
-              Yes, {confirming.label.toLowerCase()}
-            </button>
-            <button
-              type="button"
-              onClick={() => setConfirming(null)}
-              className="border border-line px-3 py-1.5 text-[12.5px] text-ink-soft hover:border-ink hover:text-ink"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {error && (
-        <p role="alert" className="mt-2.5 text-[12.5px] text-magenta">
-          {error}
-        </p>
-      )}
     </section>
   );
 }
