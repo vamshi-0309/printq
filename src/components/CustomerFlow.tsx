@@ -412,24 +412,11 @@ export function CustomerFlow({
     );
   }
 
-  if (!shopOnline && step === "upload") {
-    return (
-      <div className="border border-line bg-paper-grey/70 p-6 text-center">
-        <span className="mx-auto flex h-11 w-11 items-center justify-center border border-line bg-paper text-ink-soft">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-            <path d="M7 9V3.5h10V9M3 9h18v8H3z" />
-            <path d="M5.5 5.5 18.5 18.5" />
-          </svg>
-        </span>
-        <p className="mt-3 text-[14.5px] font-semibold text-ink">
-          {shopName} isn&apos;t accepting orders right now
-        </p>
-        <p className="mx-auto mt-2 max-w-xs text-[12.5px] leading-relaxed text-ink-soft">
-          Their print counter is offline. Please try again shortly, or ask at the counter.
-        </p>
-      </div>
-    );
-  }
+  // The counter PC being offline does not stop ordering: paid orders wait in
+  // the queue and print, in order, when the agent reconnects. Whether the
+  // shop takes orders at all is the owner's decision (shop open / accepting
+  // orders), enforced by the order route — not inferred from the agent.
+  const counterOffline = !shopOnline && step !== "order";
 
   const paused = !controls.acceptingOrders;
   const canOrder = Boolean(breakdown) && selectedCount > 0 && !priceLoading;
@@ -438,6 +425,16 @@ export function CustomerFlow({
   return (
     <div className="pb-28">
       <StepRail step={step} />
+
+      {counterOffline && !paused && (
+        <p role="status" className="mt-4 border-l-2 border-toner-yellow bg-toner-yellow/[0.08] px-3.5 py-3 text-[13px] font-medium text-ink">
+          Printing may be delayed
+          <span className="block text-[12px] font-normal text-ink-soft">
+            {shopName}&apos;s print counter is offline right now. You can still order — your job joins
+            the queue and prints as soon as the counter is back online.
+          </span>
+        </p>
+      )}
 
       {paused && step !== "order" && (
         <p role="status" className="mt-4 border-l-2 border-toner-yellow bg-toner-yellow/[0.08] px-3.5 py-3 text-[13px] font-medium text-ink">
