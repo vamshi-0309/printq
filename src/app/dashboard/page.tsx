@@ -62,7 +62,7 @@ export default function DashboardPage() {
     );
   }
 
-  const { readiness, today, queue, counts, shop, settings, controls, printerIssue } = data;
+  const { readiness, today, queue, counts, shop, settings, controls, printerIssue, agentUpdate } = data;
   // The server's clock, advanced locally so order ages tick between refreshes.
   const now = Date.parse(data.serverTime) + Math.max(0, clock - (updatedAt ?? clock));
 
@@ -92,6 +92,22 @@ export default function DashboardPage() {
           </div>
           <Link href="/dashboard/agent" className="shrink-0 border border-ink bg-ink px-3 py-1.5 text-[12.5px] font-medium text-paper">
             Check the agent
+          </Link>
+        </section>
+      )}
+
+      {agentUpdate && (
+        <section role="alert" className="flex flex-wrap items-center justify-between gap-3 border-2 border-magenta bg-magenta/[0.06] px-4 py-3">
+          <div>
+            <p className="text-[15px] font-semibold text-magenta">Update the PrintQ agent</p>
+            <p className="text-[12.5px] text-ink-soft">
+              Your counter PC runs version {agentUpdate.installed}. Orders now carry orientation, fit-to-page and
+              mixed colour settings that need version {agentUpdate.required} or later, so they wait in the queue
+              instead of printing wrongly. Install the new version and they print straight away.
+            </p>
+          </div>
+          <Link href="/downloads/windows" className="shrink-0 border border-ink bg-ink px-3 py-1.5 text-[12.5px] font-medium text-paper">
+            Download the agent
           </Link>
         </section>
       )}

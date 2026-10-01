@@ -6,7 +6,13 @@ import { canTransition, type JobState } from "@/lib/jobState";
 import { selectPrinterForShop, type SelectedPrinter } from "@/lib/printerSelection";
 import { requeueStaleClaims } from "@/lib/jobMaintenance";
 import { isPrinterProblem, printerProblemLabel } from "@/lib/printerHealth";
-import { resolvePageColors, parsePageRange, type ColorRange } from "@/lib/pageRange";
+import type { ColorRange } from "@/lib/pageRange";
+import {
+  MIN_AGENT_VERSION,
+  missingCapabilities,
+  parseCapabilities,
+  printSettingsFor,
+} from "@/lib/printSettings";
 
 /**
  * An agent asking for its next print job.
@@ -103,30 +109,6 @@ interface CandidateJob {
     color_ranges: ColorRange[] | null;
     fit_mode: string | null;
   };
-}
-
-/**
- * The passes the agent makes for a mixed-colour order: each page range with
- * its own colour setting, in page order. Null for a single-mode order, which
- * prints exactly as it always has. Derived from the same resolvePageColors
- * that priced the order, so what prints in colour is what was billed as
- * colour.
- */
-function colorSegmentsFor(order: CandidateJob["orders"]) {
-  if (!order.color_ranges || order.color_ranges.length === 0) return null;
-  const range = order.page_range ?? "all";
-  const numbers = (range.match(/\d+/g) ?? []).map(Number);
-  const documentPages = range === "all" ? (order.page_count ?? 0) : Math.max(order.page_count ?? 0, ...numbers);
-  const selected = parsePageRange(range === "all" ? `1-${documentPages}` : range, documentPages);
-  if (!selected.ok) return null;
-  const colors = resolvePageColors(
-    selected.pages,
-    documentPages,
-    order.color_mode === "color" ? "color" : "bw",
-    order.color_ranges
-  );
-  if (!colors.ok || colors.segments.length < 2) return null;
-  return colors.segments;
 }
 
 /**
@@ -240,13 +222,13 @@ export async function POST(req: NextRequest) {
 
   const printer: SelectedPrinter = selection.printer;
 
-  // Agents announce what they can print. One installed before per-range
-  // colour existed would print a mixed order all in one mode — not what
-  // the customer was billed for — so such jobs are parked for the owner
-  // instead of being handed to it.
-  const capabilities = new Set(
-    (req.headers.get("x-printq-capabilities") ?? "").split(",").map((c) => c.trim())
-  );
+  // Agents announce what they can print (X-PrintQ-Capabilities, 1.1.0+). A
+  // job is only handed to an agent that can print every one of its settings
+  // exactly; see src/lib/printSettings.ts. Jobs it can't are left QUEUED —
+  // not failed, not parked — and print as soon as an updated agent asks.
+  const capabilities = parseCapabilities(req.headers.get("x-printq-capabilities"));
+  let waitingForUpdate = 0;
+  const missingAll = new Set<string>();
 
   // The chosen printer has told the spooler it can't print. Hand out nothing:
   // the jobs stay QUEUED, so nothing has been attempted and nothing can be
@@ -310,14 +292,11 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    if (order.color_ranges && order.color_ranges.length > 0 && !capabilities.has("color-segments")) {
-      await parkUndeliverable(
-        supabase,
-        job,
-        order.id,
-        auth.shopId,
-        "This order prints some pages in colour and some in black & white. Update the PrintQ agent on the counter PC to print it, then send it to the queue again."
-      );
+    const printSettings = printSettingsFor(order);
+    const missing = missingCapabilities(printSettings, capabilities);
+    if (missing.length > 0) {
+      waitingForUpdate += 1;
+      missing.forEach((m) => missingAll.add(m));
       continue;
     }
 
@@ -401,20 +380,28 @@ export async function POST(req: NextRequest) {
       // The shop owner's choice, by id and by the exact Windows name. The
       // agent prints to this and to nothing else.
       printer,
-      printSettings: {
-        colorMode: order.color_mode,
-        paperSize: order.paper_size,
-        orientation: order.orientation,
-        sides: order.sides,
-        copies: order.copies,
-        pageRange: order.page_range,
-        pageCount: order.page_count,
-        // "fit" scales each page to the paper; "actual" prints at 100%.
-        fitMode: order.fit_mode ?? "fit",
-        // Mixed colour only: print these passes in order instead of one.
-        colorSegments: colorSegmentsFor(order),
-      },
+      // Built by the one definition the agent's tests are checked against.
+      printSettings,
     });
+  }
+
+  // Work is waiting that this agent cannot print exactly. Say so: an agent
+  // 1.0.0 surfaces a 409's message in its log and activity list, so the
+  // owner is told rather than the job silently printing with the wrong
+  // orientation, scaling or colour.
+  if (waitingForUpdate > 0) {
+    console.warn(
+      `[agent-claim] shop=${auth.shopId} agent=${auth.agentId} lacks ${[...missingAll].join(",")} for ${waitingForUpdate} job(s)`
+    );
+    return NextResponse.json(
+      {
+        error: `Update PrintQ Agent to version ${MIN_AGENT_VERSION} or later. ${waitingForUpdate} paid job${waitingForUpdate === 1 ? " is" : "s are"} waiting for print settings this version can't apply.`,
+        code: "agent_update_required",
+        missingCapabilities: [...missingAll],
+        queuedJobs: waitingForUpdate,
+      },
+      { status: 409 }
+    );
   }
 
   // Nothing claimable for this shop right now.

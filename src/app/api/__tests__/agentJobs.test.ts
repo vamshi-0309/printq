@@ -393,19 +393,37 @@ describe("mixed-colour orders reach the agent as print passes", () => {
     expect(body.printSettings.fitMode).toBe("fit");
   });
 
-  it("never hands a mixed order to an agent that can't print it that way", async () => {
+  it("a v1.0.0 agent (no capabilities) is never handed a job — it is told to update", async () => {
     const { orderId, jobId } = addJob({ state: "QUEUED" });
     db.one("orders", { id: orderId }).color_ranges = [{ range: "1", mode: "color" }];
+    addJob({ state: "QUEUED" }); // a plain order needs fit-mode too
 
-    // An agent from before per-range colour sends no capabilities.
-    expect((await claimAs(AGENT, SHOP, "")).status).toBe(204);
-    expect(db.one("print_jobs", { id: jobId }).state).toBe("HELD");
-    expect(db.one("orders", { id: orderId }).failure_reason).toMatch(/Update the PrintQ agent/);
+    const res = await claimAs(AGENT, SHOP, "");
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.code).toBe("agent_update_required");
+    expect(body.error).toMatch(/Update PrintQ Agent to version 1\.1\.0/);
+    expect(body.queuedJobs).toBe(2);
+    // Nothing claimed, nothing parked: both still in the queue, untouched.
+    expect(db.rows("print_jobs", { state: "QUEUED" })).toHaveLength(2);
+    expect(db.one("print_jobs", { id: jobId }).claimed_by_agent_id).toBeNull();
   });
 
-  it("still serves single-mode orders to an older agent", async () => {
+  it("an agent lacking only orientation still gets jobs that don't need it", async () => {
+    const needsOrientation = addJob({ state: "QUEUED" });
+    db.one("orders", { id: needsOrientation.orderId }).orientation = "landscape";
+    const plain = addJob({ state: "QUEUED" });
+
+    const res = await claimAs(AGENT, SHOP, "fit-mode,color-segments");
+    expect(res.status).toBe(200);
+    expect((await res.json()).jobId).toBe(plain.jobId);
+    expect(db.one("print_jobs", { id: needsOrientation.jobId }).state).toBe("QUEUED");
+  });
+
+  it("the moment an updated agent asks, the waiting jobs print", async () => {
     addJob({ state: "QUEUED" });
-    expect((await claimAs(AGENT, SHOP, "")).status).toBe(200);
+    expect((await claimAs(AGENT, SHOP, "")).status).toBe(409);
+    expect((await claimAs(AGENT, SHOP)).status).toBe(200);
   });
 
   it("sends no passes for a single-mode order, so it prints exactly as before", async () => {

@@ -217,8 +217,14 @@ async function deliverWebhook(cashfreeOrderId: string, amount: number, paymentId
   );
 }
 
+// An up-to-date (1.1.0) agent, announcing what it can print.
 const claimJob = () =>
-  claim(new NextRequest("http://t/api/agent/jobs/claim", { method: "POST" }));
+  claim(
+    new NextRequest("http://t/api/agent/jobs/claim", {
+      method: "POST",
+      headers: { "x-printq-capabilities": "color-segments,fit-mode,orientation" },
+    })
+  );
 
 /* ─────────────────────────────────────────────────────────────── */
 

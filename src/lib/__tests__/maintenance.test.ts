@@ -118,6 +118,12 @@ describe("dashboard states for the new flows", () => {
     expect(s.detail).toMatch(/Out of paper/);
   });
 
+  it("a queued order behind an outdated agent says to update it", () => {
+    const s = deriveOrderState({ ...base, paymentStatus: "paid", printStatus: "queued", jobState: "QUEUED", agentUpdateNeeded: true });
+    expect(s.label).toBe("Waiting — update the agent");
+    expect(s.blocked).toBe(true);
+  });
+
   it("awaiting a top-up is not 'in queue'", () => {
     const s = deriveOrderState({ ...base, paymentStatus: "paid", printStatus: "awaiting_topup", jobState: "AWAITING_TOPUP" });
     expect(s.key).toBe("awaiting_topup");

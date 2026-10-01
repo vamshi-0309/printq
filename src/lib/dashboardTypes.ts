@@ -13,6 +13,7 @@ export interface OverviewResponse {
   shop: { id: string; slug: string; name: string; city: string | null; status: string };
   readiness: ShopReadiness;
   controls: ShopControls;
+  agentUpdate: { installed: string; required: string } | null;
   printerIssue: {
     printer: string;
     problem: string;

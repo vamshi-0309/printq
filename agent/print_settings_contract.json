@@ -1,0 +1,71 @@
+{
+  "_about": "The print-settings contract between the web app and PrintQ Agent. Read by src/lib/__tests__/printContract.test.ts (the server must send exactly `printSettings` for `order`, and bill `billedPages`) and by agent/test_print_contract.py (the agent must turn `printSettings` into exactly `sumatraRuns`, printing `billedPages` pages in total, and must announce every capability in `requiredCapabilities`). Change both sides together, or neither.",
+  "knownSettingKeys": ["colorMode", "paperSize", "orientation", "sides", "copies", "pageRange", "pageCount", "fitMode", "colorSegments"],
+  "cases": [
+    {
+      "name": "plain black & white, whole document, fit to page",
+      "documentPages": 3,
+      "order": { "color_mode": "bw", "paper_size": "A4", "orientation": "auto", "sides": "single", "copies": 1, "page_range": "all", "page_count": 3, "color_ranges": null, "fit_mode": "fit" },
+      "printSettings": { "colorMode": "bw", "paperSize": "A4", "orientation": "auto", "sides": "single", "copies": 1, "pageRange": "all", "pageCount": 3, "fitMode": "fit", "colorSegments": null },
+      "requiredCapabilities": ["fit-mode"],
+      "sumatraRuns": ["simplex,monochrome,paper=A4,fit"],
+      "billedPages": 3
+    },
+    {
+      "name": "colour A3 landscape, double-sided, page range, two copies, actual size",
+      "documentPages": 5,
+      "order": { "color_mode": "color", "paper_size": "A3", "orientation": "landscape", "sides": "double", "copies": 2, "page_range": "2-4", "page_count": 3, "color_ranges": null, "fit_mode": "actual" },
+      "printSettings": { "colorMode": "color", "paperSize": "A3", "orientation": "landscape", "sides": "double", "copies": 2, "pageRange": "2-4", "pageCount": 3, "fitMode": "actual", "colorSegments": null },
+      "requiredCapabilities": ["fit-mode", "orientation"],
+      "sumatraRuns": ["2-4,2x,duplex,paper=A3,landscape,noscale"],
+      "billedPages": 6
+    },
+    {
+      "name": "mixed: black & white with pages 3-4 in colour, portrait, two copies (collated)",
+      "documentPages": 6,
+      "order": { "color_mode": "bw", "paper_size": "A4", "orientation": "portrait", "sides": "single", "copies": 2, "page_range": "all", "page_count": 6, "color_ranges": [{ "range": "3-4", "mode": "color" }], "fit_mode": "fit" },
+      "printSettings": {
+        "colorMode": "bw", "paperSize": "A4", "orientation": "portrait", "sides": "single", "copies": 2, "pageRange": "all", "pageCount": 6, "fitMode": "fit",
+        "colorSegments": [
+          { "pageRange": "1-2", "colorMode": "bw" },
+          { "pageRange": "3-4", "colorMode": "color" },
+          { "pageRange": "5-6", "colorMode": "bw" }
+        ]
+      },
+      "requiredCapabilities": ["fit-mode", "orientation", "color-segments"],
+      "sumatraRuns": [
+        "1-2,simplex,monochrome,paper=A4,portrait,fit",
+        "3-4,simplex,paper=A4,portrait,fit",
+        "5-6,simplex,monochrome,paper=A4,portrait,fit",
+        "1-2,simplex,monochrome,paper=A4,portrait,fit",
+        "3-4,simplex,paper=A4,portrait,fit",
+        "5-6,simplex,monochrome,paper=A4,portrait,fit"
+      ],
+      "billedPages": 12
+    },
+    {
+      "name": "mixed: colour with page 7 in black & white, selected pages only",
+      "documentPages": 8,
+      "order": { "color_mode": "color", "paper_size": "A4", "orientation": "auto", "sides": "single", "copies": 1, "page_range": "1-3,7", "page_count": 4, "color_ranges": [{ "range": "7", "mode": "bw" }], "fit_mode": "fit" },
+      "printSettings": {
+        "colorMode": "color", "paperSize": "A4", "orientation": "auto", "sides": "single", "copies": 1, "pageRange": "1-3,7", "pageCount": 4, "fitMode": "fit",
+        "colorSegments": [
+          { "pageRange": "1-3", "colorMode": "color" },
+          { "pageRange": "7", "colorMode": "bw" }
+        ]
+      },
+      "requiredCapabilities": ["fit-mode", "color-segments"],
+      "sumatraRuns": ["1-3,simplex,paper=A4,fit", "7,simplex,monochrome,paper=A4,fit"],
+      "billedPages": 4
+    },
+    {
+      "name": "order created before the migration (columns at their defaults)",
+      "documentPages": 2,
+      "order": { "color_mode": "bw", "paper_size": "A4", "orientation": null, "sides": "single", "copies": 1, "page_range": null, "page_count": 2, "color_ranges": null, "fit_mode": null },
+      "printSettings": { "colorMode": "bw", "paperSize": "A4", "orientation": "auto", "sides": "single", "copies": 1, "pageRange": "all", "pageCount": 2, "fitMode": "fit", "colorSegments": null },
+      "requiredCapabilities": ["fit-mode"],
+      "sumatraRuns": ["simplex,monochrome,paper=A4,fit"],
+      "billedPages": 2
+    }
+  ]
+}

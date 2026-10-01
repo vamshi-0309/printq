@@ -72,6 +72,8 @@ export interface OrderStateInput {
   printStartedAt?: string | null;
   /** "Out of paper" etc. when the shop's chosen printer reports a problem. */
   printerProblem?: string | null;
+  /** The connected agent is too old to print current orders exactly. */
+  agentUpdateNeeded?: boolean;
   now?: Date;
 }
 
@@ -242,6 +244,17 @@ export function deriveOrderState(input: OrderStateInput): DerivedOrderState {
         label: "Waiting — agent offline",
         detail:
           "Paid and in the queue, but no agent is connected to print it. Start the PrintQ agent on your counter PC.",
+        tone: "danger",
+        blocked: true,
+        active: true,
+      };
+    }
+    if (input.agentUpdateNeeded) {
+      return {
+        key: "waiting_agent",
+        label: "Waiting — update the agent",
+        detail:
+          "The PrintQ agent on your counter PC is too old to print this order's settings exactly. Install the latest version and it prints straight away.",
         tone: "danger",
         blocked: true,
         active: true,

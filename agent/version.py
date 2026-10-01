@@ -13,7 +13,7 @@ builds an installer carrying the same number. Nothing else needs editing.
 
 from __future__ import annotations
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 #: Shown in the UI and the tray tooltip.
 AGENT_NAME = "PrintQ Agent"

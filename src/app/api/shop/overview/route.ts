@@ -9,6 +9,7 @@ import { selectPrinterForShop } from "@/lib/printerSelection";
 import { printerProblemLabel } from "@/lib/printerHealth";
 import { moneyHeld, type PaymentRow, PAYMENT_COLUMNS } from "@/lib/orderMoney";
 import type { JobState } from "@/lib/jobState";
+import { agentVersionOutdated, MIN_AGENT_VERSION } from "@/lib/printSettings";
 
 /**
  * Everything the overview screen needs, in one authenticated request.
@@ -116,6 +117,9 @@ export async function GET() {
   const printerName = (id: string | null) =>
     (id ? printerRows.find((p) => p.id === id)?.display_name : chosenRow?.display_name) ?? null;
   const shopGateway = settingsRes.data?.payment_gateway ?? null;
+  // Only a live agent's version matters: it is the one asking for work.
+  const liveAgent = readiness.agentOnline ? readiness.activeAgent : null;
+  const agentUpdateNeeded = Boolean(liveAgent && agentVersionOutdated(liveAgent.version));
 
   const queue = activeOrders.map((o) => {
     const jobState = jobStateByOrder.get(o.id) ?? null;
@@ -128,6 +132,7 @@ export async function GET() {
       failureReason: o.failure_reason,
       printStartedAt: o.print_started_at,
       printerProblem,
+      agentUpdateNeeded,
       now,
     });
     const held = moneyHeld(paymentsByOrder.get(o.id) ?? []);
@@ -217,6 +222,9 @@ export async function GET() {
     },
     readiness,
     controls: controlsFrom(settingsRes.data),
+    agentUpdate: agentUpdateNeeded
+      ? { installed: liveAgent?.version ?? "unknown", required: MIN_AGENT_VERSION }
+      : null,
     printerIssue: printerProblem
       ? {
           printer: chosenRow?.display_name ?? "Your printer",
