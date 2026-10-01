@@ -240,6 +240,14 @@ export async function POST(req: NextRequest) {
 
   const printer: SelectedPrinter = selection.printer;
 
+  // Agents announce what they can print. One installed before per-range
+  // colour existed would print a mixed order all in one mode — not what
+  // the customer was billed for — so such jobs are parked for the owner
+  // instead of being handed to it.
+  const capabilities = new Set(
+    (req.headers.get("x-printq-capabilities") ?? "").split(",").map((c) => c.trim())
+  );
+
   // The chosen printer has told the spooler it can't print. Hand out nothing:
   // the jobs stay QUEUED, so nothing has been attempted and nothing can be
   // printed twice once the problem is fixed.
@@ -298,6 +306,17 @@ export async function POST(req: NextRequest) {
         order.id,
         auth.shopId,
         "No document is attached to this order, so it can't be printed."
+      );
+      continue;
+    }
+
+    if (order.color_ranges && order.color_ranges.length > 0 && !capabilities.has("color-segments")) {
+      await parkUndeliverable(
+        supabase,
+        job,
+        order.id,
+        auth.shopId,
+        "This order prints some pages in colour and some in black & white. Update the PrintQ agent on the counter PC to print it, then send it to the queue again."
       );
       continue;
     }

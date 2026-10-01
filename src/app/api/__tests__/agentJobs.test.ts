@@ -45,12 +45,19 @@ const AGENT = "a6e70000-0000-4000-8000-000000000001";
 const AGENT_2 = "a6e70000-0000-4000-8000-000000000002";
 const PRINTER = "9r1n7e70-0000-4000-8000-000000000001";
 
-function headers(agent = AGENT, shop = SHOP) {
-  return { "x-printq-shop-id": shop, "x-printq-agent-id": agent, "x-printq-agent-secret": "s" };
+function headers(agent = AGENT, shop = SHOP, capabilities = "color-segments,fit-mode,orientation") {
+  return {
+    "x-printq-shop-id": shop,
+    "x-printq-agent-id": agent,
+    "x-printq-agent-secret": "s",
+    "x-printq-capabilities": capabilities,
+  };
 }
 
-const claimAs = (agent = AGENT, shop = SHOP) =>
-  claim(new NextRequest("http://t/api/agent/jobs/claim", { method: "POST", headers: headers(agent, shop) }));
+const claimAs = (agent = AGENT, shop = SHOP, capabilities?: string) =>
+  claim(
+    new NextRequest("http://t/api/agent/jobs/claim", { method: "POST", headers: headers(agent, shop, capabilities) })
+  );
 
 const attemptAs = (jobId: string, agent = AGENT) =>
   attempted(
@@ -384,6 +391,21 @@ describe("mixed-colour orders reach the agent as print passes", () => {
       { pageRange: "5-6", colorMode: "bw" },
     ]);
     expect(body.printSettings.fitMode).toBe("fit");
+  });
+
+  it("never hands a mixed order to an agent that can't print it that way", async () => {
+    const { orderId, jobId } = addJob({ state: "QUEUED" });
+    db.one("orders", { id: orderId }).color_ranges = [{ range: "1", mode: "color" }];
+
+    // An agent from before per-range colour sends no capabilities.
+    expect((await claimAs(AGENT, SHOP, "")).status).toBe(204);
+    expect(db.one("print_jobs", { id: jobId }).state).toBe("HELD");
+    expect(db.one("orders", { id: orderId }).failure_reason).toMatch(/Update the PrintQ agent/);
+  });
+
+  it("still serves single-mode orders to an older agent", async () => {
+    addJob({ state: "QUEUED" });
+    expect((await claimAs(AGENT, SHOP, "")).status).toBe(200);
   });
 
   it("sends no passes for a single-mode order, so it prints exactly as before", async () => {

@@ -89,6 +89,10 @@ DEV_MODE = os.environ.get("PRINTQ_DEV_MODE", "false").lower() == "true"
 from dataclasses import dataclass
 
 
+#: Print features beyond the original settings, announced on every request.
+AGENT_CAPABILITIES = "color-segments,fit-mode,orientation"
+
+
 @dataclass
 class PrintJob:
     jobId: str
@@ -154,6 +158,10 @@ class PrintQClient:
             # Identifies the build in server logs without carrying anything
             # identifying about the shop.
             "User-Agent": user_agent(),
+            # What this build can print. The server never hands a job that
+            # needs a missing capability to an agent that would print it
+            # differently from how it was billed.
+            "X-PrintQ-Capabilities": AGENT_CAPABILITIES,
         }
 
     def heartbeat(self, printers: list[dict], hostname: str = "", spooler_ok: bool = True) -> dict:
